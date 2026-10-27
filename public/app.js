@@ -62,7 +62,7 @@ function enterRoom(roomId) {
   try { connectSocket(); } catch (e) { toast(e.message); return; }
   state.socket.emit('room:join', { roomId }, response => {
     if (response?.error) { toast(response.error); return; }
-    state.room = response.room; state.queue = response.room.queue || []; state.participants = response.room.participants || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin; state.queueLocked = false;
+    state.room = response.room; state.queue = response.room.queue || []; state.participants = response.room.participants || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin; state.queueLocked = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>';
     $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
     state.socket.off('room:queue').on('room:queue', queue => { const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
     state.socket.off('room:participants').on('room:participants', people => { state.participants = people; renderParticipants(); syncPeers(people); });
@@ -142,8 +142,9 @@ function togglePlayback() {
 }
 function applyPlayback(playback) {
   if (!playback || state.isDj) return;
+  if (!playback.track && playback.index == null) { state.selectedTrack = null; $('#localAudio').pause(); state.youtube?.pauseVideo?.(); $('#playerPlaceholder').classList.remove('hidden'); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#playBtn').textContent = '▶'; $('#nowTitle').textContent = 'Henüz şarkı seçilmedi'; $('#nowArtist').textContent = 'Sıradan bir parça seçerek başlayın'; return; }
   const track = playback.track || state.queue[playback.index ?? state.selectedTrack]; if (!track) return;
-  state.repeat = playback.repeat || state.repeat; state.shuffle = !!playback.shuffle; updateRepeatButton();
+  state.repeat = playback.repeat || state.repeat; state.shuffle = !!playback.shuffle; updateRepeatButton(); $('#shuffleBtn').classList.toggle('active', state.shuffle);
   const index = state.queue.findIndex(t => t.id === track.id); state.selectedTrack = index >= 0 ? index : (Number.isInteger(playback.index) ? playback.index : 0);
   if (!state.queue[state.selectedTrack] || state.queue[state.selectedTrack].id !== track.id) state.queue[state.selectedTrack] = track;
   const target = Math.max(0, Number(playback.position) || 0) + (playback.playing ? Math.max(0, (Date.now() - (playback.serverTime || Date.now())) / 1000) : 0);

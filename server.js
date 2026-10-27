@@ -162,7 +162,7 @@ io.use(async (socket, next) => {
 });
 io.on('connection', socket => {
   socket.on('room:join', async ({ roomId, username } = {}, done = () => {}) => {
-    if (socket.data.roomId && socket.data.roomId !== roomId) await leaveCurrentRoom(socket);
+    if (socket.data.roomId && socket.data.roomId !== roomId) { try { await leaveCurrentRoom(socket); } catch (error) { console.error('Room switch cleanup failed:', error.message); return done({ error: 'Önceki odadan ayrılırken bağlantı hatası oluştu.' }); } }
     roomId = String(roomId || '').trim().slice(0, 40);
     if (!/^[a-zA-Z0-9_-]{3,40}$/.test(roomId)) return done({ error: 'Oda kodu geçersiz.' });
     const set = roomState.get(roomId) || new Map();
@@ -240,10 +240,8 @@ io.on('connection', socket => {
     participant.micOn = !!micOn; participant.cameraOn = !!cameraOn; io.to(roomId).emit('room:participants', [...roomState.get(roomId).values()]);
   });
   socket.on('rtc:signal', ({ to, signal } = {}) => { if (typeof to === 'string' && signal && JSON.stringify(signal).length < 100000) io.to(to).emit('rtc:signal', { from: socket.id, signal }); });
-  socket.on('room:leave', () => leaveCurrentRoom(socket));
-  socket.on('disconnect', () => {
-    leaveCurrentRoom(socket);
-  });
+  socket.on('room:leave', () => { leaveCurrentRoom(socket).catch(error => console.error('Room leave failed:', error.message)); });
+  socket.on('disconnect', () => { leaveCurrentRoom(socket).catch(error => console.error('Room disconnect cleanup failed:', error.message)); });
 });
 
 async function leaveCurrentRoom(socket) {
