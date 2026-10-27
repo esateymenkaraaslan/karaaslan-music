@@ -40,7 +40,7 @@ async function bootstrap() {
   setTheme(localStorage.getItem('km_theme') || 'dark');
   let retryAuth = false;
   if (state.token) { try { state.user = (await api('/api/me')).user; setTheme(state.user.theme || localStorage.getItem('km_theme')); } catch (error) { if (error.status === 401) { state.token = ''; localStorage.removeItem('km_token'); sessionStorage.removeItem('km_token'); sessionStorage.removeItem('km_remember'); } else { retryAuth = true; toast('Sunucu uyandırılıyor; hesabın yeniden bağlanacak.'); } } }
-  setAuthHeader(); await refreshRooms(); if (state.user) { try { state.iceServers = (await api('/api/rtc/config')).iceServers; } catch {} connectSocket(); }
+  setAuthHeader(); await refreshRooms(); if (state.user) { try { const rtc = await api('/api/rtc/config'); state.iceServers = rtc.iceServers; state.turnConfigured = !!rtc.turnConfigured; } catch {} connectSocket(); }
   if (retryAuth) setTimeout(bootstrap, 3500);
 }
 function requireUser(action) { if (!state.user) { modalAuth('login'); return false; } return true; }
@@ -77,16 +77,16 @@ function enterRoom(roomId) {
     state.socket.off('room:queue').on('room:queue', update => { if (!state.room || update?.roomId !== state.room.roomId) return; const queue = update.queue || []; const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
     state.socket.off('room:participants').on('room:participants', update => { if (!state.room || update?.roomId !== state.room.roomId) return; state.participants = update.participants || []; renderParticipants(); syncPeers(state.participants); });
     state.socket.off('room:playback').on('room:playback', playback => { if (playback?.roomId === state.room?.roomId) applyPlayback(playback); });
-    state.socket.off('room:role').on('room:role', role => { if (role?.roomId && role.roomId !== state.room?.roomId) return; state.isDj = state.isHost || !!state.user?.isAdmin || !!role.isDj; renderParticipants(); });
+    state.socket.off('room:role').on('room:role', role => { if (role?.roomId && role.roomId !== state.room?.roomId) return; state.isDj = state.isHost || !!state.user?.isAdmin || !!role.isDj; renderPlaybackPermissions(); renderQueue(); renderParticipants(); });
     state.socket.off('room:chat').on('room:chat', msg => { if (msg?.roomId === state.room?.roomId) appendChat(msg); });
     state.socket.off('room:details').on('room:details', details => { if (!state.room || details?.roomId !== state.room.roomId) return; Object.assign(state.room, details); $('#roomTitle').textContent = state.room.name; $('#roomVisibility').textContent = state.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; refreshRooms(); });
     state.socket.off('room:closed').on('room:closed', event => { if (event?.roomId && event.roomId !== state.room?.roomId) return; toast('Oda sahibi odayı kapattı.'); leaveRoom({ notifyServer: false }); });
     state.socket.off('room:kicked').on('room:kicked', event => { if (event?.roomId && event.roomId !== state.room?.roomId) return; toast('Oda sahibi seni odadan çıkardı.'); leaveRoom({ notifyServer: false }); });
-    state.socket.off('room:host').on('room:host', host => { if (!state.room || host?.roomId !== state.room.roomId) return; state.room.hostId = host.hostId; state.room.hostName = host.hostName; state.isHost = !!host.isHost; state.isDj = state.isHost || !!host.isDj || !!state.user?.isAdmin; $('#hostName').textContent = host.hostName; $('#participantList').dataset.owner = host.hostId; $('#deleteRoom').classList.toggle('hidden', !state.isHost && !state.user?.isAdmin); renderParticipants(); });
+    state.socket.off('room:host').on('room:host', host => { if (!state.room || host?.roomId !== state.room.roomId) return; state.room.hostId = host.hostId; state.room.hostName = host.hostName; state.isHost = !!host.isHost; state.isDj = state.isHost || !!host.isDj || !!state.user?.isAdmin; $('#hostName').textContent = host.hostName; $('#participantList').dataset.owner = host.hostId; $('#deleteRoom').classList.toggle('hidden', !state.isHost && !state.user?.isAdmin); renderPlaybackPermissions(); renderQueue(); renderParticipants(); });
     state.socket.off('rtc:signal').on('rtc:signal', message => onSignal(message));
     state.socket.off('disconnect').on('disconnect', () => { if (state.room) toast('Bağlantı koptu, yeniden bağlanılıyor…'); });
     $('#deleteRoom').classList.toggle('hidden', !state.isHost && !state.user?.isAdmin);
-    state.repeat = response.room.playback?.repeat || 'off'; state.shuffle = !!response.room.playback?.shuffle; state.lastPlaybackRevision = response.room.playback?.revision || 0; updateRepeatButton(); $('#shuffleBtn').classList.toggle('active', state.shuffle); state.selectedTrack = null;
+    state.repeat = response.room.playback?.repeat || 'off'; state.shuffle = !!response.room.playback?.shuffle; state.lastPlaybackRevision = response.room.playback?.revision || 0; updateRepeatButton(); $('#shuffleBtn').classList.toggle('active', state.shuffle); renderPlaybackPermissions(); state.selectedTrack = null;
     if (response.room.playback?.track && Number.isInteger(response.room.playback.index)) { state.selectedTrack = response.room.playback.index; const elapsed = response.room.playback.playing ? Math.max(0, (Date.now() - (response.room.playback.serverTime || Date.now())) / 1000) : 0; loadTrackMedia(response.room.playback.track, (response.room.playback.position || 0) + elapsed, response.room.playback.playing); }
   });
 }
@@ -94,14 +94,20 @@ function renderParticipants() {
   const ownerId = $('#participantList').dataset.owner;
   $('#participantCount').textContent = `${state.participants.length} kişi`;
   $('#participantList').innerHTML = state.participants.map(p => `<div class="participant" data-person="${escapeHtml(p.id)}"><span class="participant-avatar">${p.avatar ? `<img src="${escapeHtml(p.avatar)}" alt="" />` : escapeHtml(initials(p.username))}</span><span>${escapeHtml(p.username)}${p.userId === state.user?.id ? ' (sen)' : ''}</span>${p.micOn ? '<span class="media-indicator">MIC</span>' : ''}${p.cameraOn ? '<span class="media-indicator">CAM</span>' : ''}${p.userId === ownerId ? '<span class="participant-role">SAHİP</span>' : p.isDj ? '<span class="participant-role">DJ</span>' : ''}${p.userId !== state.user?.id && (state.isHost || state.user?.isAdmin) ? `<button class="participant-more" data-person-menu="${escapeHtml(p.userId)}" title="Üye işlemleri">···</button>` : ''}</div>`).join('') || '<div class="side-empty">Katılımcılar yükleniyor.</div>';
-  $$('[data-person-menu]').forEach(button => button.addEventListener('click', e => { e.stopPropagation(); document.querySelectorAll('.participant-menu').forEach(menu => menu.remove()); const person = state.participants.find(p => p.userId === button.dataset.personMenu); if (!person) return; const menu = document.createElement('div'); menu.className = 'participant-menu'; menu.innerHTML = `${person.isDj ? '<button data-action="revoke">DJ yetkisini kaldır</button>' : '<button data-action="dj">DJ yap</button>'}${state.isHost ? '<button data-action="host">Oda sahipliğini devret</button>' : ''}<button data-action="kick" class="danger-action">Üyeyi odadan çıkar</button>`; button.parentElement.append(menu); menu.onclick = event => { const action = event.target.closest('[data-action]')?.dataset.action; if (!action) return; if (action === 'kick') { if (!confirm(`${person.username} odadan çıkarılsın mı?`)) return; state.socket.emit('room:kick', person.userId); } if (action === 'dj') state.socket.emit('room:dj:assign', person.userId); if (action === 'revoke') state.socket.emit('room:dj:revoke', person.userId); if (action === 'host') { if (!confirm(`Oda sahipliği ${person.username} kullanıcısına devredilsin mi?`)) return; state.socket.emit('room:host:transfer', person.userId); } menu.remove(); }; document.addEventListener('click', () => menu.remove(), { once: true }); }));
+  $$('[data-person-menu]').forEach(button => button.addEventListener('click', e => { e.stopPropagation(); document.querySelectorAll('.participant-menu').forEach(menu => menu.remove()); const person = state.participants.find(p => p.userId === button.dataset.personMenu); if (!person) return; const menu = document.createElement('div'); menu.className = 'participant-menu'; menu.innerHTML = `${person.isDj ? '<button data-action="revoke">DJ yetkisini kaldır</button>' : '<button data-action="dj">DJ yap</button>'}${state.isHost ? '<button data-action="host">Oda sahipliğini devret</button>' : ''}<button data-action="kick" class="danger-action">Üyeyi odadan çıkar</button>`; button.parentElement.append(menu); menu.onclick = event => { const action = event.target.closest('[data-action]')?.dataset.action; if (!action) return; if (action === 'kick') { if (!confirm(`${person.username} odadan çıkarılsın mı?`)) return; state.socket.emit('room:kick', person.userId); } if (action === 'dj' || action === 'revoke') { const eventName = action === 'dj' ? 'room:dj:assign' : 'room:dj:revoke'; state.socket.emit(eventName, person.userId, result => { if (result?.error) toast(result.error); else toast(action === 'dj' ? `${person.username} DJ oldu.` : `${person.username} için DJ rolü kaldırıldı.`); }); } if (action === 'host') { if (!confirm(`Oda sahipliği ${person.username} kullanıcısına devredilsin mi?`)) return; state.socket.emit('room:host:transfer', person.userId); } menu.remove(); }; document.addEventListener('click', () => menu.remove(), { once: true }); }));
   $('#voiceParticipants').innerHTML = state.participants.map(p => `<span class="voice-person">${escapeHtml(p.username)}${p.micOn ? ' · MIC' : ''}${p.cameraOn ? ' · CAM' : ''}</span>`).join('');
+}
+function renderPlaybackPermissions() {
+  ['#playBtn', '#prevBtn', '#nextBtn', '#shuffleBtn', '#repeatBtn', '#clearQueue'].forEach(selector => { const button = $(selector); if (button) { button.disabled = !state.isDj; button.title = state.isDj ? (button.dataset.djTitle || button.title) : 'Yalnızca oda sahibi veya DJ kullanabilir'; } });
+  $$('#queueList [data-play-index], #queueList [data-remove-track]').forEach(button => { button.disabled = !state.isDj; if (!state.isDj) button.title = 'Yalnızca oda sahibi veya DJ kullanabilir'; });
+  $$('#searchResults [data-add-track]').forEach(button => { button.disabled = !state.isDj; button.title = state.isDj ? 'Kuyruğa ekle' : 'Yalnızca oda sahibi veya DJ kuyruğa ekleyebilir'; });
+  $$('.player-controls input[type="range"]').forEach(input => { if (input.id === 'seekBar') input.disabled = !state.isDj; });
 }
 function updateVoiceConnectionStatus() {
   const label = $('#voiceConnectionStatus'); if (!label) return;
   const peers = [...state.peers.values()];
   if (!peers.length) { label.textContent = 'Odada başka biri olduğunda ses ve kamera bağlantısı kurulur.'; return; }
-  if (peers.some(peer => peer.connectionState === 'failed')) { label.textContent = 'Bağlantı kurulamadı. Farklı ağlarda TURN sunucusu gerekebilir.'; return; }
+  if (peers.some(peer => peer.connectionState === 'failed')) { label.textContent = state.turnConfigured === false ? 'Bağlantı kurulamadı. Farklı ağlarda görüşme için Render’a TURN_URL, TURN_USERNAME ve TURN_PASSWORD eklenmeli.' : 'Bağlantı kurulamadı. Görüşme yeniden bağlanmayı denedi.'; return; }
   label.textContent = peers.every(peer => peer.connectionState === 'connected') ? 'Ses ve kamera bağlantısı kuruldu.' : 'Karşı tarafın cihazına bağlanıyor…';
 }
 function renderQueue() {
@@ -120,6 +126,7 @@ async function searchTracks() {
     if (state.source === 'youtube') items = (await api(`/api/youtube/search?q=${encodeURIComponent(q)}`)).items;
     else { const catalog = await api('/api/catalog'); items = catalog.filter(t => `${t.title} ${t.artist}`.toLowerCase().includes(q.toLowerCase())).map(t => ({ ...t, id: t._id, thumbnail: '' })); }
     $('#searchResults').innerHTML = items?.length ? items.map(item => `<div class="search-result"><img src="${escapeHtml(item.thumbnail || '')}" alt="" /><div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.artist)}</span></div><button data-add-track="${escapeHtml(item.id)}" title="Kuyruğa ekle">＋</button></div>`).join('') : '<div class="search-hint">Sonuç bulunamadı.</div>';
+    renderPlaybackPermissions();
     $$('[data-add-track]').forEach(button => button.addEventListener('click', () => { const item = items.find(x => x.id === button.dataset.addTrack); addTrack(state.source === 'youtube' ? { title: item.title, artist: item.artist, source: 'youtube', videoId: item.id, thumbnail: item.thumbnail } : { title: item.title, artist: item.artist, source: 'library', url: item.url }); }));
   } catch (e) { $('#searchResults').innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`; }
 }
@@ -162,7 +169,7 @@ function applyPendingYoutube() {
   state.pendingYoutube = null;
 }
 function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
-function syncPlayback(playing = true) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position: playerPosition(), index: state.selectedTrack, track: state.queue[state.selectedTrack], repeat: state.repeat, shuffle: state.shuffle }); $('#playBtn').textContent = playing ? 'Ⅱ' : '▶'; }
+function syncPlayback(playing = true) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position: playerPosition(), index: state.selectedTrack, track: state.queue[state.selectedTrack], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); $('#playBtn').textContent = playing ? 'Ⅱ' : '▶'; }
 function togglePlayback() {
   if (!state.isDj) return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
   if (state.selectedTrack == null) return state.queue.length ? playAt(0) : toast('Önce kuyruğa bir şarkı ekle.');
@@ -206,6 +213,7 @@ function createPeer(remoteId) {
   if (state.voiceStream) pc.audioSender.replaceTrack(state.voiceStream.getAudioTracks()[0] || null).catch(error => console.warn('Mikrofon izi gönderilemedi:', error));
   if (state.cameraStream) pc.videoSender.replaceTrack(state.cameraStream.getVideoTracks()[0] || null).catch(error => console.warn('Kamera izi gönderilemedi:', error));
   pc.onicecandidate = e => { if (e.candidate && state.socket?.connected) state.socket.emit('rtc:signal', { to: remoteId, signal: { candidate: e.candidate } }); };
+  pc.onicecandidateerror = event => console.warn(`ICE adayı ${remoteId} için üretilemedi:`, event.errorCode, event.errorText);
   pc.ontrack = e => {
     let stream = state.remoteStreams.get(remoteId);
     if (!stream) { stream = new MediaStream(); state.remoteStreams.set(remoteId, stream); }
@@ -225,18 +233,38 @@ function createPeer(remoteId) {
   };
   pc.onconnectionstatechange = () => {
     updateVoiceConnectionStatus();
-    if (pc.connectionState === 'failed' && !pc.iceRestartTried && state.socket?.id < remoteId) {
-      pc.iceRestartTried = true; toast('Ses/kamera bağlantısı yenileniyor…');
-      pc.restartIce(); pc.createOffer({ iceRestart: true }).then(offer => pc.setLocalDescription(offer)).then(() => state.socket?.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(() => {});
-      setTimeout(() => { if (pc.connectionState === 'failed') closePeer(remoteId, pc); }, 7000);
+    if (pc.connectionState === 'failed') {
+      if (!pc.iceRestartTried && state.socket?.id < remoteId) {
+        pc.iceRestartTried = true; toast('Ses/kamera bağlantısı yenileniyor…');
+        pc.restartIce(); pc.createOffer({ iceRestart: true }).then(offer => pc.setLocalDescription(offer)).then(() => state.socket?.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(error => console.warn('ICE yeniden başlatılamadı:', error));
+      } else if (!pc.failureTimer) {
+        toast('Ses/kamera bağlantısı yenileniyor. Farklı ağlarda TURN sunucusu gerekebilir.');
+        pc.failureTimer = setTimeout(() => {
+          if (pc.connectionState !== 'failed' || state.peers.get(remoteId) !== pc) return;
+          closePeer(remoteId, pc); createPeer(remoteId);
+        }, 7000);
+      }
       return;
     }
-    if (pc.connectionState === 'failed') toast('Ses/kamera bağlantısı kurulamadı. Farklı ağlar arasında TURN sunucusu gerekebilir.');
-    if (['failed', 'closed'].includes(pc.connectionState)) closePeer(remoteId, pc);
+    if (pc.connectionState === 'connected') { clearTimeout(pc.failureTimer); pc.failureTimer = null; }
+    if (pc.connectionState === 'closed') closePeer(remoteId, pc);
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'disconnected') {
+      clearTimeout(pc.recoveryTimer);
+      pc.recoveryTimer = setTimeout(() => {
+        if (pc.iceConnectionState !== 'disconnected' || pc.signalingState !== 'stable' || pc.iceRestartTried) return;
+        pc.iceRestartTried = true;
+        pc.restartIce();
+        pc.createOffer({ iceRestart: true }).then(offer => pc.setLocalDescription(offer)).then(() => state.socket?.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(error => console.warn('ICE bağlantısı yenilenemedi:', error));
+      }, 2500);
+    } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      clearTimeout(pc.recoveryTimer); pc.iceRestartTried = false;
+    }
   };
   if (state.socket.id < remoteId) pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => state.socket.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(() => {});
 }
-function closePeer(id, peer = state.peers.get(id)) { if (!peer) return; peer.close(); state.peers.delete(id); state.remoteStreams.delete(id); document.querySelector(`[data-remote-audio="${id}"]`)?.remove(); document.querySelector(`[data-remote-tile="${id}"]`)?.remove(); updateVoiceConnectionStatus(); }
+function closePeer(id, peer = state.peers.get(id)) { if (!peer) return; const isCurrent = state.peers.get(id) === peer; if (isCurrent) { state.peers.delete(id); state.remoteStreams.delete(id); document.querySelector(`[data-remote-audio="${id}"]`)?.remove(); document.querySelector(`[data-remote-tile="${id}"]`)?.remove(); updateVoiceConnectionStatus(); } clearTimeout(peer.recoveryTimer); clearTimeout(peer.failureTimer); peer.close(); }
 function syncPeers(people) { if (!state.room) return; const otherIds = people.filter(p => p.id !== state.socket.id).map(p => p.id); otherIds.forEach(createPeer); for (const [id, peer] of state.peers) if (!otherIds.includes(id)) closePeer(id, peer); updateVoiceConnectionStatus(); }
 async function onSignal({ from, signal }) {
   if (!from || !signal) return; if (!state.peers.has(from)) createPeer(from); const pc = state.peers.get(from); if (!pc) return;
@@ -347,7 +375,7 @@ window.addEventListener('storage', async event => {
   if (event.key !== 'km_token') return;
   if (!event.newValue) { if (state.room) leaveRoom(); state.socket?.disconnect(); state.socket = null; state.socketConfigured = false; state.token = ''; state.user = null; setAuthHeader(); toast('Diğer sekmede oturum kapatıldı.'); return; }
   state.token = event.newValue;
-  try { state.user = (await api('/api/me')).user; setAuthHeader(); try { state.iceServers = (await api('/api/rtc/config')).iceServers; } catch {} connectSocket(); toast('Oturum bu sekmede de açıldı.'); }
+  try { state.user = (await api('/api/me')).user; setAuthHeader(); try { const rtc = await api('/api/rtc/config'); state.iceServers = rtc.iceServers; state.turnConfigured = !!rtc.turnConfigured; } catch {} connectSocket(); toast('Oturum bu sekmede de açıldı.'); }
   catch { state.token = ''; state.user = null; localStorage.removeItem('km_token'); setAuthHeader(); }
 });
 function routeHash() {

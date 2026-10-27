@@ -79,7 +79,7 @@ app.patch('/api/me', auth, async (req, res) => {
 app.get('/api/rtc/config', auth, (_req, res) => {
   const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
   if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_PASSWORD) iceServers.push({ urls: process.env.TURN_URL.split(',').map(value => value.trim()).filter(Boolean), username: process.env.TURN_USERNAME, credential: process.env.TURN_PASSWORD });
-  res.json({ iceServers });
+  res.json({ iceServers, turnConfigured: iceServers.length > 1 });
 });
 app.post('/api/me/avatar', auth, express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '2mb' }), async (req, res) => {
   if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Profil resmi gönderilmedi.' });
@@ -270,33 +270,37 @@ io.on('connection', socket => {
     else if (Number.isInteger(playback.index) && removedIndex < playback.index) playback = { ...playback, roomId, revision: (playback.revision || 0) + 1, index: playback.index - 1, updatedAt: new Date(), serverTime: Date.now() };
     await db.collection('rooms').updateOne({ roomId }, { $set: { queue, playback } }); io.to(roomId).emit('room:queue', { roomId, queue }); io.to(roomId).emit('room:playback', { ...playback, roomId }); io.emit('rooms:update');
   });
-  socket.on('room:playback', state => {
-    const roomId = socket.data.roomId; if (!roomId || state?.roomId !== roomId) return;
+  socket.on('room:playback', (state, done = () => {}) => {
+    const roomId = socket.data.roomId; if (!roomId || state?.roomId !== roomId) return done({ error: 'Oda bağlantısı bulunamadı. Odaya yeniden katıl.' });
     queuePlaybackWrite(roomId, async () => {
-      if (socket.data.roomId !== roomId) return;
+      if (socket.data.roomId !== roomId) return { error: 'Oda bağlantısı değişti. Odaya yeniden katıl.' };
       const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
-      if (!room || (!set?.get(socket.id)?.isDj && room.hostId !== socket.user.sub)) return;
-      if (state.heartbeat) { if (room.hostId !== socket.user.sub || Date.now() - (roomPlaybackControlAt.get(roomId) || 0) < 2500) return; }
+      if (!room || (!set?.get(socket.id)?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return { error: 'Oynatma kontrolü yalnızca oda sahibi veya DJ kullanabilir.' };
+      if (state.heartbeat) { if (room.hostId !== socket.user.sub || Date.now() - (roomPlaybackControlAt.get(roomId) || 0) < 2500) return { ok: true, ignored: true }; }
       else roomPlaybackControlAt.set(roomId, Date.now());
       const queue = room.queue || []; let index = null; let track = null;
-      if (state.track?.id) { index = queue.findIndex(item => item.id === state.track.id); if (index < 0) return; track = queue[index]; }
+      if (state.track?.id) { index = queue.findIndex(item => item.id === state.track.id); if (index < 0) return { error: 'Bu parça artık oda kuyruğunda değil. Kuyruğu yenile.' }; track = queue[index]; }
       else if (Number.isInteger(state.index) && state.index >= 0 && state.index < queue.length) { index = state.index; track = queue[index]; }
-      if (state.playing && !track) return;
+      if (state.playing && !track) return { error: 'Oynatılacak parça bulunamadı.' };
       const playback = { roomId, revision: (room.playback?.revision || 0) + 1, playing: !!state.playing && !!track, position: track ? Math.max(0, Number(state.position) || 0) : 0, index, track, repeat: ['off', 'all', 'one'].includes(state.repeat) ? state.repeat : (room.playback?.repeat || 'off'), shuffle: !!state.shuffle, updatedAt: new Date(), serverTime: Date.now() };
-      await db.collection('rooms').updateOne({ roomId }, { $set: { playback } }); io.to(roomId).emit('room:playback', playback);
-    }).catch(error => console.error('Playback sync failed:', error.message));
+      await db.collection('rooms').updateOne({ roomId }, { $set: { playback } }); io.to(roomId).emit('room:playback', playback); return { ok: true, revision: playback.revision };
+    }).then(result => done(result || { ok: true })).catch(error => { console.error('Playback sync failed:', error.message); done({ error: 'Oynatma güncellenemedi. Tekrar dene.' }); });
   });
-  socket.on('room:dj:assign', async userId => {
+  socket.on('room:dj:assign', async (userId, done = () => {}) => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
-    if (room?.hostId !== socket.user.sub && !socket.user.admin) return;
-    for (const [id, p] of set || []) { if (p.userId === userId && p.userId !== room.hostId) { p.isDj = true; io.to(id).emit('room:role', { roomId, isDj: true }); } }
+    if (room?.hostId !== socket.user.sub && !socket.user.admin) return done({ error: 'DJ yetkisini yalnızca oda sahibi verebilir.' });
+    let assigned = false; for (const [id, p] of set || []) { if (p.userId === userId && p.userId !== room.hostId) { p.isDj = true; assigned = true; io.to(id).emit('room:role', { roomId, isDj: true }); } }
+    if (!assigned) return done({ error: 'Bu kullanıcı şu anda odada değil.' });
     io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] });
+    done({ ok: true });
   });
-  socket.on('room:dj:revoke', async userId => {
+  socket.on('room:dj:revoke', async (userId, done = () => {}) => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
-    if (room?.hostId !== socket.user.sub && !socket.user.admin) return;
-    for (const [id, p] of set || []) if (p.userId === userId && p.userId !== room.hostId) { p.isDj = false; io.to(id).emit('room:role', { roomId, isDj: false }); }
+    if (room?.hostId !== socket.user.sub && !socket.user.admin) return done({ error: 'DJ yetkisini yalnızca oda sahibi kaldırabilir.' });
+    let revoked = false; for (const [id, p] of set || []) if (p.userId === userId && p.userId !== room.hostId) { p.isDj = false; revoked = true; io.to(id).emit('room:role', { roomId, isDj: false }); }
+    if (!revoked) return done({ error: 'Bu kullanıcı DJ değil veya artık odada değil.' });
     io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] });
+    done({ ok: true });
   });
   socket.on('room:kick', async userId => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });

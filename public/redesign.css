@@ -14,3 +14,4 @@
 .voice-connection-status{display:block;margin-top:6px;color:var(--muted);font-size:11px;line-height:1.5}.voice-connection-status:empty{display:none}
 
 .video-retry{position:absolute;z-index:4;left:50%;top:50%;transform:translate(-50%,-50%);border:1px solid var(--line);border-radius:999px;padding:8px 12px;background:var(--panel);color:var(--text);font-size:11px;font-weight:700;box-shadow:0 6px 22px #0007}
+#roomView button:disabled{cursor:not-allowed;opacity:.42;filter:saturate(.4)}
