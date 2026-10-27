@@ -28,11 +28,11 @@ app.use('/uploads', express.static(uploadDir, { fallthrough: false, maxAge: '1h'
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 
 function tokenFor(user) {
-  return jwt.sign({ sub: user._id.toString(), username: user.username, admin: !!user.isAdmin }, secret, { expiresIn: '7d' });
+  return jwt.sign({ sub: user._id.toString(), username: user.username, admin: !!user.isAdmin, ver: user.tokenVersion || 0 }, secret, { expiresIn: '7d' });
 }
-function auth(req, res, next) {
+async function auth(req, res, next) {
   const value = req.headers.authorization || '';
-  try { req.user = jwt.verify(value.replace(/^Bearer\s+/i, ''), secret); next(); }
+  try { const payload = jwt.verify(value.replace(/^Bearer\s+/i, ''), secret); if (!ObjectId.isValid(payload.sub)) throw new Error('Invalid account'); const account = await db.collection('users').findOne({ _id: new ObjectId(payload.sub) }, { projection: { username: 1, isAdmin: 1, tokenVersion: 1 } }); if (!account || (payload.ver || 0) !== (account.tokenVersion || 0)) return res.status(401).json({ error: 'Oturum sona erdi. Yeniden giriş yap.' }); req.user = { ...payload, username: account.username, admin: !!account.isAdmin }; next(); }
   catch { res.status(401).json({ error: 'Oturum açmanız gerekiyor.' }); }
 }
 function admin(req, res, next) {
@@ -92,18 +92,19 @@ app.post('/api/me/avatar', auth, express.raw({ type: ['image/jpeg', 'image/png',
 });
 app.get('/api/catalog', async (_req, res) => res.json(await db.collection('tracks').find({}).sort({ createdAt: -1 }).limit(500).toArray()));
 app.get('/api/rooms', async (_req, res) => {
-  const rooms = await db.collection('rooms').find({}).sort({ createdAt: -1 }).limit(40).toArray();
-  res.json(rooms.map(r => ({ roomId: r.roomId, name: r.name, mood: r.mood, hostId: r.hostId, hostName: r.hostName || '', queueCount: (r.queue || []).length, participants: roomState.get(r.roomId)?.size || 0, createdAt: r.createdAt })));
+  const rooms = await db.collection('rooms').find({ $or: [{ visibility: 'public' }, { visibility: { $exists: false } }] }).sort({ createdAt: -1 }).limit(40).toArray();
+  res.json(rooms.map(r => ({ roomId: r.roomId, name: r.name, mood: r.mood, visibility: r.visibility || 'public', hostId: r.hostId, hostName: r.hostName || '', queueCount: (r.queue || []).length, participants: roomState.get(r.roomId)?.size || 0, createdAt: r.createdAt })));
 });
 app.post('/api/rooms', auth, async (req, res) => {
-  const roomId = crypto.randomBytes(4).toString('hex');
+  const roomId = crypto.randomBytes(8).toString('hex');
   const name = String(req.body.name || '').trim().slice(0, 50);
   if (name.length < 2) return res.status(400).json({ error: 'Oda adı en az 2 karakter olmalı.' });
   const mood = String(req.body.mood || 'Serbest dinleme').slice(0, 30);
-  const room = { roomId, name, mood, hostId: req.user.sub, hostName: req.user.username, queue: [], playback: { playing: false, position: 0, updatedAt: new Date() }, createdAt: new Date() };
+  const visibility = req.body.visibility === 'private' ? 'private' : 'public';
+  const room = { roomId, name, mood, visibility, hostId: req.user.sub, hostName: req.user.username, queue: [], playback: { playing: false, position: 0, updatedAt: new Date(), repeat: 'off' }, createdAt: new Date() };
   await db.collection('rooms').insertOne(room);
   io.emit('rooms:update');
-  res.status(201).json({ roomId, name, mood, hostId: room.hostId, queueCount: 0, participants: 0 });
+  res.status(201).json({ roomId, name, mood, visibility, hostId: room.hostId, queueCount: 0, participants: 0 });
 });
 app.patch('/api/rooms/:roomId', auth, async (req, res) => {
   const roomId = String(req.params.roomId || '').slice(0, 40);
@@ -113,6 +114,7 @@ app.patch('/api/rooms/:roomId', auth, async (req, res) => {
   const updates = {};
   if (typeof req.body.name === 'string') { const name = req.body.name.trim().slice(0, 50); if (name.length < 2) return res.status(400).json({ error: 'Oda adı en az 2 karakter olmalı.' }); updates.name = name; }
   if (typeof req.body.mood === 'string') updates.mood = req.body.mood.trim().slice(0, 30);
+  if (['public', 'private'].includes(req.body.visibility)) updates.visibility = req.body.visibility;
   await db.collection('rooms').updateOne({ roomId }, { $set: updates });
   io.to(roomId).emit('room:details', updates); io.emit('rooms:update'); res.json({ roomId, ...updates });
 });
@@ -140,7 +142,62 @@ app.get('/api/youtube/search', async (req, res) => {
 app.get('/api/admin/overview', auth, admin, async (_req, res) => {
   const [users, tracks, rooms] = await Promise.all([db.collection('users').countDocuments(), db.collection('tracks').countDocuments(), db.collection('rooms').countDocuments()]);
   const recentRooms = await db.collection('rooms').find({}).sort({ createdAt: -1 }).limit(12).toArray();
-  res.json({ users, tracks, activeRooms: rooms, recentTracks: await db.collection('tracks').find({}).sort({ createdAt: -1 }).limit(8).toArray(), recentRooms: recentRooms.map(r => ({ roomId: r.roomId, name: r.name, hostName: r.hostName, mood: r.mood, queue: r.queue || [], participants: roomState.get(r.roomId)?.size || 0 })) });
+  res.json({ users, tracks, activeRooms: rooms, recentTracks: await db.collection('tracks').find({}).sort({ createdAt: -1 }).limit(8).toArray(), recentRooms: recentRooms.map(r => ({ roomId: r.roomId, name: r.name, hostName: r.hostName, mood: r.mood, visibility: r.visibility || 'public', queue: r.queue || [], participants: roomState.get(r.roomId)?.size || 0 })) });
+});
+app.get('/api/admin/users', auth, admin, async (_req, res) => {
+  const users = await db.collection('users').find({}, { projection: { passwordHash: 0 } }).sort({ createdAt: -1 }).limit(300).toArray();
+  res.json(users.map(user => ({ ...publicUser(user), createdAt: user.createdAt || null })));
+});
+app.patch('/api/admin/users/:id', auth, admin, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Hesap kimliği geçersiz.' });
+  const id = new ObjectId(req.params.id); const current = await db.collection('users').findOne({ _id: id });
+  if (!current) return res.status(404).json({ error: 'Hesap bulunamadı.' });
+  const updates = {};
+  if (typeof req.body.username === 'string') { const username = req.body.username.trim(); if (!/^[a-zA-Z0-9_]{3,24}$/.test(username)) return res.status(400).json({ error: 'Kullanıcı adı 3–24 karakter olmalı; harf, rakam ve _ kullanılabilir.' }); updates.username = username; }
+  if (typeof req.body.email === 'string') { const email = req.body.email.trim().toLowerCase(); if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Geçerli bir e-posta adresi girin.' }); updates.email = email; }
+  if (typeof req.body.bio === 'string') updates.bio = req.body.bio.slice(0, 160);
+  if (typeof req.body.isAdmin === 'boolean') {
+    if (current.isAdmin && !req.body.isAdmin && await db.collection('users').countDocuments({ isAdmin: true }) <= 1) return res.status(409).json({ error: 'Son yönetici hesabının yetkisi kaldırılamaz.' });
+    updates.isAdmin = req.body.isAdmin;
+  }
+  if (typeof req.body.password === 'string' && req.body.password) { if (req.body.password.length < 8) return res.status(400).json({ error: 'Yeni şifre en az 8 karakter olmalı.' }); updates.passwordHash = await bcrypt.hash(req.body.password, 12); updates.tokenVersion = (current.tokenVersion || 0) + 1; }
+  try { await db.collection('users').updateOne({ _id: id }, { $set: updates }); }
+  catch (error) { if (error.code === 11000) return res.status(409).json({ error: 'Bu kullanıcı adı veya e-posta başka hesapta kullanılıyor.' }); throw error; }
+  if (updates.passwordHash) { for (const socket of io.of('/').sockets.values()) if (socket.user.sub === id.toString()) { socket.emit('auth:revoked'); socket.disconnect(true); } }
+  else if (updates.isAdmin !== undefined || updates.username) { for (const socket of io.of('/').sockets.values()) if (socket.user.sub === id.toString()) socket.disconnect(true); }
+  const updated = await db.collection('users').findOne({ _id: id }); res.json({ user: publicUser(updated) });
+});
+app.delete('/api/admin/users/:id', auth, admin, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Hesap kimliği geçersiz.' });
+  const id = new ObjectId(req.params.id); const user = await db.collection('users').findOne({ _id: id });
+  if (!user) return res.status(404).json({ error: 'Hesap bulunamadı.' });
+  if (id.toString() === req.user.sub) return res.status(400).json({ error: 'Kendi yönetici hesabını bu panelden silemezsin.' });
+  if (user.isAdmin && await db.collection('users').countDocuments({ isAdmin: true }) <= 1) return res.status(409).json({ error: 'Son yönetici hesabı silinemez.' });
+  const ownedRooms = await db.collection('rooms').find({ hostId: id.toString() }).toArray();
+  await db.collection('users').deleteOne({ _id: id });
+  for (const socket of io.of('/').sockets.values()) if (socket.user.sub === id.toString()) { socket.emit('auth:revoked'); socket.disconnect(true); }
+  await db.collection('rooms').updateMany({ hostId: id.toString() }, { $set: { hostId: req.user.sub, hostName: req.user.username } });
+  for (const room of ownedRooms) for (const [socketId, participant] of roomState.get(room.roomId) || []) io.to(socketId).emit('room:host', { hostId: req.user.sub, hostName: req.user.username, isHost: false, isDj: participant.isDj });
+  io.emit('rooms:update');
+  res.json({ ok: true });
+});
+app.get('/api/admin/tracks', auth, admin, async (_req, res) => {
+  const tracks = await db.collection('tracks').find({}).sort({ createdAt: -1 }).limit(300).toArray();
+  res.json(tracks.map(track => ({ ...track, id: track._id.toString(), _id: undefined })));
+});
+app.delete('/api/admin/tracks/:id', auth, admin, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) return res.status(400).json({ error: 'Şarkı kimliği geçersiz.' });
+  const id = new ObjectId(req.params.id); const track = await db.collection('tracks').findOne({ _id: id });
+  if (!track) return res.status(404).json({ error: 'Şarkı bulunamadı.' });
+  await db.collection('tracks').deleteOne({ _id: id });
+  if (typeof track.url === 'string' && track.url.startsWith('/uploads/')) { const filename = path.basename(track.url); try { fs.unlinkSync(path.join(uploadDir, filename)); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+  if (track.url) {
+    const rooms = await db.collection('rooms').find({ 'queue.url': track.url }).toArray();
+    for (const room of rooms) { const queue = (room.queue || []).filter(item => item.url !== track.url); await db.collection('rooms').updateOne({ roomId: room.roomId }, { $set: { queue } }); io.to(room.roomId).emit('room:queue', queue); }
+    const playingIn = await db.collection('rooms').find({ 'playback.track.url': track.url }).toArray();
+    for (const room of playingIn) { const playback = { ...(room.playback || {}), playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() }; await db.collection('rooms').updateOne({ roomId: room.roomId }, { $set: { playback } }); io.to(room.roomId).emit('room:playback', playback); }
+  }
+  res.json({ ok: true });
 });
 app.post('/api/admin/tracks', auth, admin, express.raw({ type: ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/wave', 'audio/ogg', 'audio/mp4', 'audio/x-m4a', 'audio/aac', 'audio/x-aac', 'audio/flac', 'audio/x-flac'], limit: '30mb' }), async (req, res) => {
   if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Ses dosyası gönderilmedi.' });
@@ -152,12 +209,11 @@ app.post('/api/admin/tracks', auth, admin, express.raw({ type: ['audio/mpeg', 'a
   const track = { title: String(req.query.title || 'İsimsiz şarkı').slice(0, 120), artist: String(req.query.artist || 'Bilinmeyen sanatçı').slice(0, 120), source: 'library', url: `/uploads/${id}${ext}`, createdAt: new Date() };
   const result = await db.collection('tracks').insertOne(track); res.status(201).json({ ...track, id: result.insertedId.toString() });
 });
-app.get('/api/admin/users', auth, admin, async (_req, res) => res.json(await db.collection('users').find({}, { projection: { passwordHash: 0 } }).sort({ createdAt: -1 }).limit(200).toArray()));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const roomState = new Map();
 io.use(async (socket, next) => {
-  try { const p = jwt.verify(socket.handshake.auth?.token || '', secret); socket.user = p; next(); }
+  try { const p = jwt.verify(socket.handshake.auth?.token || '', secret); if (!ObjectId.isValid(p.sub)) throw new Error('Invalid account'); const account = await db.collection('users').findOne({ _id: new ObjectId(p.sub) }, { projection: { username: 1, isAdmin: 1, tokenVersion: 1 } }); if (!account || (p.ver || 0) !== (account.tokenVersion || 0)) throw new Error('Account not found or session expired'); socket.user = { ...p, username: account.username, admin: !!account.isAdmin }; next(); }
   catch { next(new Error('Oturum açmanız gerekiyor.')); }
 });
 io.on('connection', socket => {
@@ -170,8 +226,9 @@ io.on('connection', socket => {
     const dbUser = await db.collection('users').findOne({ _id: new ObjectId(socket.user.sub) });
     const participant = { id: socket.id, userId: socket.user.sub, username: dbUser?.username || username || 'Dinleyici', avatar: dbUser?.avatar || '', isAdmin: !!socket.user.admin, isDj: !!socket.user.admin, micOn: false, cameraOn: false };
     set.set(socket.id, participant); roomState.set(roomId, set); socket.join(roomId); socket.data.roomId = roomId; socket.data.participant = participant;
-    const room = await db.collection('rooms').findOneAndUpdate({ roomId }, { $setOnInsert: { roomId, hostId: socket.user.sub, queue: [], playback: { playing: false, position: 0, updatedAt: new Date() }, createdAt: new Date() } }, { upsert: true, returnDocument: 'after' });
-    done({ room: { roomId, name: room.name, hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback: room.playback || { playing: false, position: 0, index: null }, participants: [...set.values()] } });
+    const room = await db.collection('rooms').findOne({ roomId });
+    if (!room) { set.delete(socket.id); socket.leave(roomId); socket.data.roomId = null; if (!set.size) roomState.delete(roomId); return done({ error: 'Bu oda artık mevcut değil.' }); }
+    done({ room: { roomId, name: room.name, mood: room.mood, visibility: room.visibility || 'public', hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback: room.playback || { playing: false, position: 0, index: null }, participants: [...set.values()] } });
     if (room.playback?.playing) socket.emit('room:playback', room.playback);
     io.to(roomId).emit('room:participants', [...set.values()]);
     io.emit('rooms:update');
@@ -279,15 +336,15 @@ async function start() {
   await users.createIndex({ username: 1 }, { unique: true, collation: { locale: 'en', strength: 2 }, partialFilterExpression: { username: { $type: 'string' } } });
   await users.createIndex({ email: 1 }, { unique: true, partialFilterExpression: { email: { $type: 'string' } } });
   await db.collection('rooms').createIndex({ roomId: 1 }, { unique: true });
-  if (process.env.ADMIN_USERNAME && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD !== 'change-this-before-first-run') {
+  let bootstrapAdmin = await db.collection('users').findOne({ bootstrapAdmin: true });
+  if (!bootstrapAdmin && process.env.ADMIN_USERNAME && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD !== 'change-this-before-first-run') {
     const username = process.env.ADMIN_USERNAME.trim();
     const email = process.env.ADMIN_EMAIL.trim().toLowerCase();
     const escapedUsername = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    let adminUser = await db.collection('users').findOne({ username: { $regex: `^${escapedUsername}$`, $options: 'i' } });
-    if (!adminUser) adminUser = await db.collection('users').findOne({ email });
-    const adminFields = { username, email, passwordHash: await bcrypt.hash(process.env.ADMIN_PASSWORD, 12), isAdmin: true };
-    if (!adminUser) await db.collection('users').insertOne({ ...adminFields, theme: 'dark', createdAt: new Date() });
-    else await db.collection('users').updateOne({ _id: adminUser._id }, { $set: adminFields });
+    bootstrapAdmin = await db.collection('users').findOne({ username: { $regex: `^${escapedUsername}$`, $options: 'i' } });
+    if (!bootstrapAdmin) bootstrapAdmin = await db.collection('users').findOne({ email });
+    if (!bootstrapAdmin) await db.collection('users').insertOne({ username, email, passwordHash: await bcrypt.hash(process.env.ADMIN_PASSWORD, 12), isAdmin: true, bootstrapAdmin: true, tokenVersion: 0, theme: 'dark', createdAt: new Date() });
+    else await db.collection('users').updateOne({ _id: bootstrapAdmin._id }, { $set: { isAdmin: true, bootstrapAdmin: true } });
   }
   server.listen(port, () => console.log(`Karaaslan Müzik http://localhost:${port}`));
 }

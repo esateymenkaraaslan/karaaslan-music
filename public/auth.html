@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#10131b" />
+  <title>Giriş yap · Karaaslan Müzik</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/redesign.css" />
+  <link rel="stylesheet" href="/auth.css" />
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <section class="auth-art" aria-hidden="true">
+      <a class="brand auth-brand" href="/" aria-label="Karaaslan Müzik ana sayfa"><span class="brand-mark"><i></i><i></i><i></i></span><span>Karaaslan <span class="brand-light">Müzik</span></span></a>
+      <div class="auth-art-copy"><span class="auth-kicker">AYNI RİTİMDE BULUŞ</span><h1>Bir şarkı,<br /><em>aynı oda.</em></h1><p>Arkadaşlarını bul, sırayı kur ve birlikte dinlemeye başla.</p></div>
+      <div class="auth-vinyl"><span></span></div>
+      <div class="auth-art-foot"><span>© 2026 KARAASLAN MÜZİK</span><span>Developed by Esat Eymen Karaaslan</span></div>
+    </section>
+    <section class="auth-content">
+      <a class="auth-back" href="/">← Ana sayfaya dön</a>
+      <div class="auth-card">
+        <div class="auth-mobile-brand"><span class="brand-mark"><i></i><i></i><i></i></span><b>Karaaslan Müzik</b></div>
+        <div class="auth-kicker" id="authEyebrow">KARAASLAN MÜZİK'E KATIL</div>
+        <h2 id="authTitle">Tekrar hoş geldin.</h2>
+        <p class="auth-description" id="authDescription">Kaldığın yerden dinlemeye devam et.</p>
+        <form id="authForm" novalidate>
+          <label for="username">Kullanıcı adı</label>
+          <input id="username" name="username" minlength="3" maxlength="24" required autocomplete="username" placeholder="kullanıcı_adı" />
+          <div id="emailField" class="auth-field hidden"><label for="email">E-posta</label><input id="email" name="email" type="email" autocomplete="email" placeholder="ornek@mail.com" /></div>
+          <label for="password">Şifre</label>
+          <div class="password-field"><input id="password" name="password" type="password" minlength="8" required autocomplete="current-password" placeholder="Şifren" /><button type="button" id="passwordToggle" aria-label="Şifreyi göster">Göster</button></div>
+          <div class="auth-options"><label class="remember-option"><input id="remember" type="checkbox" checked /> <span>Bu cihazda oturumu açık tut</span></label></div>
+          <p id="authError" class="auth-error" role="alert"></p>
+          <button class="auth-submit" id="authSubmit" type="submit"><span>Giriş yap</span><b>→</b></button>
+        </form>
+        <p class="auth-switch"><span id="switchPrompt">Henüz hesabın yok mu?</span> <a id="authSwitch" href="/auth.html?mode=register">Hesap oluştur</a></p>
+        <p class="auth-note">Oturumunu daha sonra profil menüsünden kapatabilirsin.</p>
+      </div>
+      <div class="auth-mobile-foot">Developed by Esat Eymen Karaaslan</div>
+    </section>
+  </main>
+  <script src="/auth.js" defer></script>
+</body>
+</html>

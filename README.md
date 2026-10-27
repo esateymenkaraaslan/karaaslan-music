@@ -13,7 +13,7 @@ Oda tabanlı ortak müzik dinleme uygulaması. Node.js, Express, MongoDB ve Sock
 1. Bağımlılıkları yükleyin: `npm install`
 2. `.env.example` dosyasını `.env` olarak kopyalayın.
 3. `MONGODB_URI` ve en az 32 karakterlik `JWT_SECRET` değerlerini ayarlayın.
-4. Admin hesabı için `ADMIN_USERNAME`, `ADMIN_EMAIL` ve güçlü bir `ADMIN_PASSWORD` belirleyin. Bu hesap ilk açılışta oluşturulur; mevcut hesap varsa admin yetkisi tanımlanır.
+4. İlk admin hesabı için `ADMIN_USERNAME`, `ADMIN_EMAIL` ve güçlü bir `ADMIN_PASSWORD` belirleyin. İlk açılışta mevcut kullanıcı bulunursa yalnızca admin olarak işaretlenir; sonraki açılışlar panelden yapılan hesap/şifre düzenlemelerini geri almaz.
 5. YouTube araması için `YOUTUBE_API_KEY` ekleyin.
 6. Başlatın: `npm start`
 7. Tarayıcıda `http://localhost:3000` adresini açın.
@@ -32,4 +32,6 @@ Proje, Docker uyumlu bir Node web servisine dağıtılabilir. Ortam değişkenle
 
 ## Uygulama notları
 
-Oda kodu davet bağlantısında kullanılır. Oda sahibi ve DJ kuyruk ekleme, kaldırma ve oynatma kontrolü yapabilir. Üyeler kullanıcı adı ve şifreyle giriş yapar; yeni hesaplarda e-posta adresi de saklanır.
+Oda oluştururken herkese açık veya özel seçilebilir. Açık odalar dizinde görünür; özel odalar dizinde listelenmez ve oda kodu/davet bağlantısıyla açılır. Oda sahibi ve DJ kuyruk ekleme, kaldırma ve oynatma kontrolü yapabilir. Oda sahibi DJ atayabilir, üyeleri çıkarabilir ve oda ayarlarını değiştirebilir. Üyeler kullanıcı adı ve şifreyle giriş yapar; kayıt sırasında e-posta adresi de saklanır. Giriş sayfasında “Bu cihazda oturumu açık tut” seçeneği bulunur.
+
+Yönetim panelinde odalar, üye hesapları ve yüklenen şarkılar yönetilebilir. Admin hesap adı/e-postası/hakkında bilgisini ve yetki düzeyini düzenleyebilir, yeni şifre atayabilir veya hesabı silebilir. Katalogdan kaldırılan yüklemeler kuyruklardan da temizlenir.
