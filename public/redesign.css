@@ -12,3 +12,5 @@
 @media(max-width:370px){.main-content{padding-left:11px;padding-right:11px}.rooms-grid,.directory-grid{grid-template-columns:1fr}.rooms-grid .create-card,.directory-grid .create-card{grid-column:1}.sample-room .room-cover{height:100px}.room-meta{font-size:9px}.room-title-row h3{font-size:13px}.room-head-actions .button{max-width:116px;overflow:hidden}.top-actions #registerOpen{font-size:9px;padding:0 8px}.admin-user-row .button{padding:0 8px}}
 
 .voice-connection-status{display:block;margin-top:6px;color:var(--muted);font-size:11px;line-height:1.5}.voice-connection-status:empty{display:none}
+
+.video-retry{position:absolute;z-index:4;left:50%;top:50%;transform:translate(-50%,-50%);border:1px solid var(--line);border-radius:999px;padding:8px 12px;background:var(--panel);color:var(--text);font-size:11px;font-weight:700;box-shadow:0 6px 22px #0007}
