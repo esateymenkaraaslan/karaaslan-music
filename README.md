@@ -28,6 +28,7 @@ Proje, Docker uyumlu bir Node web servisine dağıtılabilir. Ortam değişkenle
 - YouTube araması resmi gömülü video oynatıcıyı kullanır; bu nedenle seçilen YouTube içeriğinin görüntüsü de görünebilir. Bu proje YouTube'dan sesi ayırıp indirmez. Yalnızca ses çalma şartı varsa, kaynak için ayrıca resmi ve ses odaklı bir playback entegrasyonu seçmek gerekir.
 - Profil ve ses dosyaları `uploads/` altında tutulur. Bu klasör yedeklenmelidir; üretim ortamında kalıcı dosya depolama kullanın.
 - Kamera ve mikrofon odada isteğe bağlıdır. Görüşme şu an WebRTC eşler arası bağlantı kullanır. `TURN_URL`, `TURN_USERNAME` ve `TURN_PASSWORD` ile TURN sunucusu tanımlanabilir. 20 katılımcı için üretim kalitesinde görüşme adına TURN ve SFU servisi (LiveKit/benzeri) gerekir; TURN/SFU kimlik bilgileri sağlanmadan görüşme tüm ağlarda garanti edilemez.
+- İki cihazla ses/kamera denemesinde ikisinin de aynı odaya girmesi, görüşme sekmesini açması ve tarayıcı izinlerini vermesi gerekir. Oda ekranında bağlantı durumu gösterilir. Bazı mobil operatör ve kurumsal ağlar STUN ile eşler arası bağlantıyı engeller; bu ağlarda Render ortam değişkenlerine bir TURN servisinin `TURN_URL`, `TURN_USERNAME` ve `TURN_PASSWORD` değerlerini ekleyin. Bu değerleri kaynak koda veya herkese açık depoya koymayın.
 - JSON dosyası yerine MongoDB kullanılır. Oda kuyruğu ve hesaplar MongoDB'ye yazılır.
 
 ## Uygulama notları

@@ -92,6 +92,13 @@ function renderParticipants() {
   $$('[data-person-menu]').forEach(button => button.addEventListener('click', e => { e.stopPropagation(); document.querySelectorAll('.participant-menu').forEach(menu => menu.remove()); const person = state.participants.find(p => p.userId === button.dataset.personMenu); if (!person) return; const menu = document.createElement('div'); menu.className = 'participant-menu'; menu.innerHTML = `${person.isDj ? '<button data-action="revoke">DJ yetkisini kaldır</button>' : '<button data-action="dj">DJ yap</button>'}${state.isHost ? '<button data-action="host">Oda sahipliğini devret</button>' : ''}<button data-action="kick" class="danger-action">Üyeyi odadan çıkar</button>`; button.parentElement.append(menu); menu.onclick = event => { const action = event.target.closest('[data-action]')?.dataset.action; if (!action) return; if (action === 'kick') { if (!confirm(`${person.username} odadan çıkarılsın mı?`)) return; state.socket.emit('room:kick', person.userId); } if (action === 'dj') state.socket.emit('room:dj:assign', person.userId); if (action === 'revoke') state.socket.emit('room:dj:revoke', person.userId); if (action === 'host') { if (!confirm(`Oda sahipliği ${person.username} kullanıcısına devredilsin mi?`)) return; state.socket.emit('room:host:transfer', person.userId); } menu.remove(); }; document.addEventListener('click', () => menu.remove(), { once: true }); }));
   $('#voiceParticipants').innerHTML = state.participants.map(p => `<span class="voice-person">${escapeHtml(p.username)}${p.micOn ? ' · MIC' : ''}${p.cameraOn ? ' · CAM' : ''}</span>`).join('');
 }
+function updateVoiceConnectionStatus() {
+  const label = $('#voiceConnectionStatus'); if (!label) return;
+  const peers = [...state.peers.values()];
+  if (!peers.length) { label.textContent = 'Odada başka biri olduğunda ses ve kamera bağlantısı kurulur.'; return; }
+  if (peers.some(peer => peer.connectionState === 'failed')) { label.textContent = 'Bağlantı kurulamadı. Farklı ağlarda TURN sunucusu gerekebilir.'; return; }
+  label.textContent = peers.every(peer => peer.connectionState === 'connected') ? 'Ses ve kamera bağlantısı kuruldu.' : 'Karşı tarafın cihazına bağlanıyor…';
+}
 function renderQueue() {
   $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`;
   if (!state.queue.length) { $('#queueList').innerHTML = '<div class="queue-empty"><span>♫</span><b>Sıra henüz boş</b><small>Yukarıdan şarkı ara veya bağlantı ekle.</small></div>'; return; }
@@ -169,6 +176,7 @@ function createPeer(remoteId) {
   if (state.peers.has(remoteId) || !state.socket) return;
   if (!window.RTCPeerConnection) { toast('Bu tarayıcı WebRTC sesli ve görüntülü görüşmeyi desteklemiyor.'); return; }
   const pc = new RTCPeerConnection({ iceServers: state.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }] }); state.peers.set(remoteId, pc);
+  updateVoiceConnectionStatus();
   pc.pendingCandidates = [];
   pc.audioSender = pc.addTransceiver('audio', { direction: 'sendrecv' }).sender; pc.videoSender = pc.addTransceiver('video', { direction: 'sendrecv' }).sender;
   if (state.voiceStream) pc.audioSender.replaceTrack(state.voiceStream.getAudioTracks()[0] || null).catch(() => {});
@@ -192,6 +200,7 @@ function createPeer(remoteId) {
     }
   };
   pc.onconnectionstatechange = () => {
+    updateVoiceConnectionStatus();
     if (pc.connectionState === 'failed' && !pc.iceRestartTried && state.socket?.id < remoteId) {
       pc.iceRestartTried = true; toast('Ses/kamera bağlantısı yenileniyor…');
       pc.restartIce(); pc.createOffer({ iceRestart: true }).then(offer => pc.setLocalDescription(offer)).then(() => state.socket?.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(() => {});
@@ -203,8 +212,8 @@ function createPeer(remoteId) {
   };
   if (state.socket.id < remoteId) pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => state.socket.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(() => {});
 }
-function closePeer(id, peer = state.peers.get(id)) { if (!peer) return; peer.close(); state.peers.delete(id); state.remoteStreams.delete(id); document.querySelector(`[data-remote-audio="${id}"]`)?.remove(); document.querySelector(`[data-remote-tile="${id}"]`)?.remove(); }
-function syncPeers(people) { if (!state.room) return; const otherIds = people.filter(p => p.id !== state.socket.id).map(p => p.id); otherIds.forEach(createPeer); for (const [id, peer] of state.peers) if (!otherIds.includes(id)) closePeer(id, peer); }
+function closePeer(id, peer = state.peers.get(id)) { if (!peer) return; peer.close(); state.peers.delete(id); state.remoteStreams.delete(id); document.querySelector(`[data-remote-audio="${id}"]`)?.remove(); document.querySelector(`[data-remote-tile="${id}"]`)?.remove(); updateVoiceConnectionStatus(); }
+function syncPeers(people) { if (!state.room) return; const otherIds = people.filter(p => p.id !== state.socket.id).map(p => p.id); otherIds.forEach(createPeer); for (const [id, peer] of state.peers) if (!otherIds.includes(id)) closePeer(id, peer); updateVoiceConnectionStatus(); }
 async function onSignal({ from, signal }) {
   if (!from || !signal) return; if (!state.peers.has(from)) createPeer(from); const pc = state.peers.get(from); if (!pc) return;
   try { if (signal.description) { await pc.setRemoteDescription(signal.description); for (const candidate of pc.pendingCandidates.splice(0)) await pc.addIceCandidate(candidate); if (signal.description.type === 'offer') { await pc.setLocalDescription(await pc.createAnswer()); state.socket.emit('rtc:signal', { to: from, signal: { description: pc.localDescription } }); } } else if (signal.candidate) { if (pc.remoteDescription) await pc.addIceCandidate(signal.candidate); else pc.pendingCandidates.push(signal.candidate); } } catch (e) { console.warn('Medya bağlantısı kurulamadı', e); }
@@ -233,7 +242,7 @@ async function toggleCamera() {
     state.socket.emit('room:media', { micOn: state.voiceOn, cameraOn: state.cameraOn }); renderParticipants();
   } catch (e) { toast(mediaErrorMessage(e, 'Kamera')); }
 }
-function leaveRoom() { state.voiceStream?.getTracks().forEach(t => t.stop()); state.cameraStream?.getTracks().forEach(t => t.stop()); for (const pc of state.peers.values()) pc.close(); state.peers.clear(); state.remoteStreams.clear(); document.querySelectorAll('[data-remote-audio],[data-remote-tile]').forEach(x => x.remove()); $('#enableRemoteAudio').classList.add('hidden'); $('#localVideo').srcObject = null; $('#localVideoTile').classList.remove('has-video'); state.voiceStream = null; state.cameraStream = null; state.voiceOn = false; state.cameraOn = false; if (state.socket && state.room) state.socket.emit('room:leave'); state.room = null; state.queue = []; state.participants = []; state.selectedTrack = null; $('#localAudio').pause(); state.youtube?.stopVideo?.(); activeView('home'); refreshRooms(); }
+function leaveRoom() { state.voiceStream?.getTracks().forEach(t => t.stop()); state.cameraStream?.getTracks().forEach(t => t.stop()); for (const pc of state.peers.values()) pc.close(); state.peers.clear(); state.remoteStreams.clear(); document.querySelectorAll('[data-remote-audio],[data-remote-tile]').forEach(x => x.remove()); $('#enableRemoteAudio').classList.add('hidden'); $('#voiceConnectionStatus').textContent = 'Odaya katıldığında bağlantı durumu burada görünür.'; $('#localVideo').srcObject = null; $('#localVideoTile').classList.remove('has-video'); state.voiceStream = null; state.cameraStream = null; state.voiceOn = false; state.cameraOn = false; if (state.socket && state.room) state.socket.emit('room:leave'); state.room = null; state.queue = []; state.participants = []; state.selectedTrack = null; $('#localAudio').pause(); state.youtube?.stopVideo?.(); activeView('home'); refreshRooms(); }
 
 $('#loginOpen').onclick = () => modalAuth('login'); $('#registerOpen').onclick = () => modalAuth('register');
 $('#logoutBtn').onclick = () => { leaveRoom(); state.socket?.disconnect(); state.socket = null; state.socketConfigured = false; state.token = ''; state.user = null; localStorage.removeItem('km_token'); sessionStorage.removeItem('km_token'); sessionStorage.removeItem('km_remember'); setAuthHeader(); toast('Oturum kapatıldı.'); };
