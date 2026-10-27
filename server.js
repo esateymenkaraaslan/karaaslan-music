@@ -296,7 +296,7 @@ io.on('connection', socket => {
     const roomId = socket.data.roomId; const participant = roomState.get(roomId)?.get(socket.id); if (!participant) return;
     participant.micOn = !!micOn; participant.cameraOn = !!cameraOn; io.to(roomId).emit('room:participants', [...roomState.get(roomId).values()]);
   });
-  socket.on('rtc:signal', ({ to, signal } = {}) => { if (typeof to === 'string' && signal && JSON.stringify(signal).length < 100000) io.to(to).emit('rtc:signal', { from: socket.id, signal }); });
+  socket.on('rtc:signal', ({ to, signal } = {}) => { const target = typeof to === 'string' ? io.sockets.sockets.get(to) : null; if (socket.data.roomId && target?.data.roomId === socket.data.roomId && signal && JSON.stringify(signal).length < 100000) target.emit('rtc:signal', { from: socket.id, signal }); });
   socket.on('room:leave', () => { leaveCurrentRoom(socket).catch(error => console.error('Room leave failed:', error.message)); });
   socket.on('disconnect', () => { leaveCurrentRoom(socket).catch(error => console.error('Room disconnect cleanup failed:', error.message)); });
 });

@@ -2,7 +2,7 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const savedToken = localStorage.getItem('km_token') || sessionStorage.getItem('km_token') || '';
 if (savedToken && !localStorage.getItem('km_token') && sessionStorage.getItem('km_remember') !== '0') localStorage.setItem('km_token', savedToken);
-const state = { token: savedToken, user: null, socket: null, socketConfigured: false, socketConnectedBefore: false, room: null, rooms: [], source: 'youtube', queue: [], participants: [], youtube: null, ytReady: false, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
+const state = { token: savedToken, user: null, socket: null, socketConfigured: false, socketConnectedBefore: false, room: null, rooms: [], source: 'youtube', queue: [], participants: [], youtube: null, ytReady: false, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
 const api = async (url, options = {}) => {
   const headers = { ...(options.body && !(options.body instanceof Blob) && !(options.body instanceof ArrayBuffer) ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
@@ -167,23 +167,55 @@ function appendChat(msg) { const line = document.createElement('div'); line.clas
 function selectTab(name) { state.currentTab = name; $$('.room-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.tab === name)); $('#queuePanel').classList.toggle('hidden', name !== 'queue'); $('#chatPanel').classList.toggle('hidden', name !== 'chat'); $('#voicePanel').classList.toggle('hidden', name !== 'voice'); if (name === 'chat') $('#chatBadge').textContent = '0'; }
 function createPeer(remoteId) {
   if (state.peers.has(remoteId) || !state.socket) return;
+  if (!window.RTCPeerConnection) { toast('Bu tarayıcı WebRTC sesli ve görüntülü görüşmeyi desteklemiyor.'); return; }
   const pc = new RTCPeerConnection({ iceServers: state.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }] }); state.peers.set(remoteId, pc);
   pc.pendingCandidates = [];
   pc.audioSender = pc.addTransceiver('audio', { direction: 'sendrecv' }).sender; pc.videoSender = pc.addTransceiver('video', { direction: 'sendrecv' }).sender;
   if (state.voiceStream) pc.audioSender.replaceTrack(state.voiceStream.getAudioTracks()[0] || null).catch(() => {});
   if (state.cameraStream) pc.videoSender.replaceTrack(state.cameraStream.getVideoTracks()[0] || null).catch(() => {});
-  pc.onicecandidate = e => { if (e.candidate) state.socket.emit('rtc:signal', { to: remoteId, signal: { candidate: e.candidate } }); };
+  pc.onicecandidate = e => { if (e.candidate && state.socket?.connected) state.socket.emit('rtc:signal', { to: remoteId, signal: { candidate: e.candidate } }); };
   pc.ontrack = e => {
-    if (e.track.kind === 'audio') { let audio = document.querySelector(`[data-remote-audio="${remoteId}"]`); if (!audio) { audio = document.createElement('audio'); audio.autoplay = true; audio.dataset.remoteAudio = remoteId; document.body.append(audio); } audio.srcObject = e.streams[0]; }
-    if (e.track.kind === 'video') { let tile = document.querySelector(`[data-remote-tile="${remoteId}"]`); if (!tile) { tile = document.createElement('div'); tile.className = 'video-tile'; tile.dataset.remoteTile = remoteId; const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true; const label = document.createElement('span'); label.textContent = state.participants.find(p => p.id === remoteId)?.username || 'Katılımcı'; tile.append(video, label); $('#videoGrid').append(tile); } tile.querySelector('video').srcObject = e.streams[0]; tile.classList.add('has-video'); e.track.onmute = () => tile.classList.remove('has-video'); e.track.onunmute = () => tile.classList.add('has-video'); }
+    let stream = state.remoteStreams.get(remoteId);
+    if (!stream) { stream = new MediaStream(); state.remoteStreams.set(remoteId, stream); }
+    if (!stream.getTracks().some(track => track.id === e.track.id)) stream.addTrack(e.track);
+    if (e.track.kind === 'audio') {
+      let audio = document.querySelector(`[data-remote-audio="${remoteId}"]`);
+      if (!audio) { audio = document.createElement('audio'); audio.autoplay = true; audio.playsInline = true; audio.dataset.remoteAudio = remoteId; document.body.append(audio); }
+      audio.srcObject = stream;
+      audio.play().then(() => $('#enableRemoteAudio').classList.add('hidden')).catch(() => { $('#enableRemoteAudio').classList.remove('hidden'); toast('Tarayıcı karşı tarafın sesini bekletiyor. Görüşme sekmesinden “Sesi etkinleştir”e dokun.'); });
+    }
+    if (e.track.kind === 'video') {
+      let tile = document.querySelector(`[data-remote-tile="${remoteId}"]`);
+      if (!tile) { tile = document.createElement('div'); tile.className = 'video-tile'; tile.dataset.remoteTile = remoteId; const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true; const label = document.createElement('span'); label.textContent = state.participants.find(p => p.id === remoteId)?.username || 'Katılımcı'; tile.append(video, label); $('#videoGrid').append(tile); }
+      tile.querySelector('video').srcObject = stream; tile.classList.toggle('has-video', e.track.readyState === 'live' && !e.track.muted);
+      e.track.onmute = () => tile.classList.remove('has-video'); e.track.onunmute = () => tile.classList.add('has-video');
+    }
   };
-  pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(pc.connectionState)) { pc.close(); state.peers.delete(remoteId); document.querySelector(`[data-remote-tile="${remoteId}"]`)?.remove(); document.querySelector(`[data-remote-audio="${remoteId}"]`)?.remove(); } };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' && !pc.iceRestartTried && state.socket?.id < remoteId) {
+      pc.iceRestartTried = true; toast('Ses/kamera bağlantısı yenileniyor…');
+      pc.restartIce(); pc.createOffer({ iceRestart: true }).then(offer => pc.setLocalDescription(offer)).then(() => state.socket?.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(() => {});
+      setTimeout(() => { if (pc.connectionState === 'failed') closePeer(remoteId, pc); }, 7000);
+      return;
+    }
+    if (pc.connectionState === 'failed') toast('Ses/kamera bağlantısı kurulamadı. Farklı ağlar arasında TURN sunucusu gerekebilir.');
+    if (['failed', 'closed'].includes(pc.connectionState)) closePeer(remoteId, pc);
+  };
   if (state.socket.id < remoteId) pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => state.socket.emit('rtc:signal', { to: remoteId, signal: { description: pc.localDescription } })).catch(() => {});
 }
-function syncPeers(people) { if (!state.room) return; const otherIds = people.filter(p => p.id !== state.socket.id).map(p => p.id); otherIds.forEach(createPeer); for (const [id, peer] of state.peers) if (!otherIds.includes(id)) { peer.close(); state.peers.delete(id); document.querySelector(`[data-remote-audio="${id}"]`)?.remove(); document.querySelector(`[data-remote-tile="${id}"]`)?.remove(); } }
+function closePeer(id, peer = state.peers.get(id)) { if (!peer) return; peer.close(); state.peers.delete(id); state.remoteStreams.delete(id); document.querySelector(`[data-remote-audio="${id}"]`)?.remove(); document.querySelector(`[data-remote-tile="${id}"]`)?.remove(); }
+function syncPeers(people) { if (!state.room) return; const otherIds = people.filter(p => p.id !== state.socket.id).map(p => p.id); otherIds.forEach(createPeer); for (const [id, peer] of state.peers) if (!otherIds.includes(id)) closePeer(id, peer); }
 async function onSignal({ from, signal }) {
   if (!from || !signal) return; if (!state.peers.has(from)) createPeer(from); const pc = state.peers.get(from); if (!pc) return;
   try { if (signal.description) { await pc.setRemoteDescription(signal.description); for (const candidate of pc.pendingCandidates.splice(0)) await pc.addIceCandidate(candidate); if (signal.description.type === 'offer') { await pc.setLocalDescription(await pc.createAnswer()); state.socket.emit('rtc:signal', { to: from, signal: { description: pc.localDescription } }); } } else if (signal.candidate) { if (pc.remoteDescription) await pc.addIceCandidate(signal.candidate); else pc.pendingCandidates.push(signal.candidate); } } catch (e) { console.warn('Medya bağlantısı kurulamadı', e); }
+}
+function mediaErrorMessage(error, device) {
+  if (['NotAllowedError', 'SecurityError'].includes(error?.name)) return `${device} izni verilmedi. Tarayıcıdan site iznini açıp yeniden dene.`;
+  if (['NotFoundError', 'DevicesNotFoundError'].includes(error?.name)) return `${device} bulunamadı.`;
+  if (['NotReadableError', 'TrackStartError'].includes(error?.name)) return `${device} başka bir uygulama tarafından kullanılıyor.`;
+  if (error?.name === 'OverconstrainedError') return `${device} bu cihazda istenen ayarlarla açılamadı.`;
+  if (!navigator.mediaDevices?.getUserMedia) return 'Bu tarayıcıda medya erişimi yok. HTTPS bağlantısı ve güncel tarayıcı gerekiyor.';
+  return `${device} erişilemedi. Tarayıcı izinlerini ve cihaz bağlantısını kontrol et.`;
 }
 async function toggleMic() {
   if (!state.room) return toast('Önce odaya katıl.');
@@ -191,7 +223,7 @@ async function toggleMic() {
     if (state.voiceStream) { for (const pc of state.peers.values()) pc.audioSender?.replaceTrack(null).catch(() => {}); state.voiceStream.getTracks().forEach(t => t.stop()); state.voiceStream = null; state.voiceOn = false; $('#micToggle').textContent = 'Mikrofonu aç'; toast('Mikrofon kapatıldı.'); }
     else { state.voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); state.voiceOn = true; const track = state.voiceStream.getAudioTracks()[0]; for (const pc of state.peers.values()) pc.audioSender?.replaceTrack(track).catch(() => {}); $('#micToggle').textContent = 'Mikrofonu kapat'; toast('Mikrofon açıldı.'); }
     state.socket.emit('room:media', { micOn: state.voiceOn, cameraOn: state.cameraOn }); renderParticipants();
-  } catch (e) { toast(e.name === 'NotAllowedError' ? 'Mikrofon izni verilmedi.' : 'Mikrofona erişilemedi.'); }
+  } catch (e) { toast(mediaErrorMessage(e, 'Mikrofon')); }
 }
 async function toggleCamera() {
   if (!state.room) return toast('Önce odaya katıl.');
@@ -199,9 +231,9 @@ async function toggleCamera() {
     if (state.cameraStream) { for (const pc of state.peers.values()) pc.videoSender?.replaceTrack(null).catch(() => {}); state.cameraStream.getTracks().forEach(t => t.stop()); state.cameraStream = null; state.cameraOn = false; $('#localVideo').srcObject = null; $('#localVideoTile').classList.remove('has-video'); $('#localVideoLabel').textContent = 'Kameranı açınca burada görünürsün'; $('#cameraToggle').textContent = 'Kamerayı aç'; toast('Kamera kapatıldı.'); }
     else { state.cameraStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { width: { ideal: 640 }, height: { ideal: 360 }, facingMode: 'user' } }); state.cameraOn = true; const track = state.cameraStream.getVideoTracks()[0]; for (const pc of state.peers.values()) pc.videoSender?.replaceTrack(track).catch(() => {}); $('#localVideo').srcObject = state.cameraStream; $('#localVideoTile').classList.add('has-video'); $('#localVideoLabel').textContent = state.user.username; $('#cameraToggle').textContent = 'Kamerayı kapat'; toast('Kamera açıldı.'); }
     state.socket.emit('room:media', { micOn: state.voiceOn, cameraOn: state.cameraOn }); renderParticipants();
-  } catch (e) { toast(e.name === 'NotAllowedError' ? 'Kamera izni verilmedi.' : 'Kameraya erişilemedi.'); }
+  } catch (e) { toast(mediaErrorMessage(e, 'Kamera')); }
 }
-function leaveRoom() { state.voiceStream?.getTracks().forEach(t => t.stop()); state.cameraStream?.getTracks().forEach(t => t.stop()); for (const pc of state.peers.values()) pc.close(); state.peers.clear(); document.querySelectorAll('[data-remote-audio],[data-remote-tile]').forEach(x => x.remove()); $('#localVideo').srcObject = null; $('#localVideoTile').classList.remove('has-video'); state.voiceStream = null; state.cameraStream = null; state.voiceOn = false; state.cameraOn = false; if (state.socket && state.room) state.socket.emit('room:leave'); state.room = null; state.queue = []; state.participants = []; state.selectedTrack = null; $('#localAudio').pause(); state.youtube?.stopVideo?.(); activeView('home'); refreshRooms(); }
+function leaveRoom() { state.voiceStream?.getTracks().forEach(t => t.stop()); state.cameraStream?.getTracks().forEach(t => t.stop()); for (const pc of state.peers.values()) pc.close(); state.peers.clear(); state.remoteStreams.clear(); document.querySelectorAll('[data-remote-audio],[data-remote-tile]').forEach(x => x.remove()); $('#enableRemoteAudio').classList.add('hidden'); $('#localVideo').srcObject = null; $('#localVideoTile').classList.remove('has-video'); state.voiceStream = null; state.cameraStream = null; state.voiceOn = false; state.cameraOn = false; if (state.socket && state.room) state.socket.emit('room:leave'); state.room = null; state.queue = []; state.participants = []; state.selectedTrack = null; $('#localAudio').pause(); state.youtube?.stopVideo?.(); activeView('home'); refreshRooms(); }
 
 $('#loginOpen').onclick = () => modalAuth('login'); $('#registerOpen').onclick = () => modalAuth('register');
 $('#logoutBtn').onclick = () => { leaveRoom(); state.socket?.disconnect(); state.socket = null; state.socketConfigured = false; state.token = ''; state.user = null; localStorage.removeItem('km_token'); sessionStorage.removeItem('km_token'); sessionStorage.removeItem('km_remember'); setAuthHeader(); toast('Oturum kapatıldı.'); };
@@ -218,6 +250,7 @@ $$('.source-option').forEach(button => button.onclick = () => { state.source = b
 $('#searchBtn').onclick = searchTracks; $('#trackSearch').onkeydown = e => { if (e.key === 'Enter') searchTracks(); };
 $('#pasteLink').onclick = () => { const value = prompt('YouTube şarkı veya video bağlantısını yapıştır:'); if (!value) return; const id = parseYouTube(value); if (!id) return toast('Geçerli bir YouTube bağlantısı değil.'); const title = prompt('Şarkı adı (isteğe bağlı):') || 'YouTube parçası'; addTrack({ title, artist: 'YouTube', source: 'youtube', videoId: id }); };
 $('#playBtn').onclick = togglePlayback; $('#nextBtn').onclick = () => nextTrack(true); $('#prevBtn').onclick = prevTrack; $('#shuffleBtn').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.shuffle = !state.shuffle; $('#shuffleBtn').classList.toggle('active', state.shuffle); syncPlayback(!!(state.queue[state.selectedTrack] && (state.queue[state.selectedTrack].source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused))); toast(state.shuffle ? 'Karıştırma açıldı.' : 'Karıştırma kapatıldı.'); }; $('#repeatBtn').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ tekrar ayarını değiştirebilir.'); state.repeat = ({ off: 'all', all: 'one', one: 'off' })[state.repeat]; updateRepeatButton(); syncPlayback(!!(state.queue[state.selectedTrack] && (state.queue[state.selectedTrack].source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused))); }; $('#clearQueue').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.socket.emit('room:queue:replace', []); state.queue = []; state.selectedTrack = null; $('#playerPlaceholder').classList.remove('hidden'); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#localAudio').pause(); state.youtube?.stopVideo?.(); state.socket.emit('room:playback', { playing: false, position: 0, index: null, track: null }); renderQueue(); toast('Kuyruk temizlendi.'); }; $('#micToggle').onclick = toggleMic; $('#cameraToggle').onclick = toggleCamera;
+$('#enableRemoteAudio').onclick = async () => { let failed = false; for (const audio of document.querySelectorAll('[data-remote-audio]')) { try { await audio.play(); } catch { failed = true; } } $('#enableRemoteAudio').classList.toggle('hidden', !failed); if (!failed) toast('Karşı tarafın sesi açıldı.'); };
 $('#localAudio').ontimeupdate = () => { if (state.localTrack || state.queue[state.selectedTrack]?.source === 'library') { const a = $('#localAudio'); $('#currentTime').textContent = fmt(a.currentTime); $('#duration').textContent = fmt(a.duration); $('#seekBar').value = a.duration ? a.currentTime / a.duration * 100 : 0; } };
 $('#localAudio').onended = () => nextTrack();
 function fmt(value) { if (!Number.isFinite(value)) return '0:00'; return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`; }
