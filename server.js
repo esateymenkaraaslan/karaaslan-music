@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const { MongoClient, ObjectId } = require('mongodb');
+const { MongoClient, ObjectId, GridFSBucket } = require('mongodb');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -18,9 +18,10 @@ const port = Number(process.env.PORT || 3000);
 const secret = process.env.JWT_SECRET;
 const mongoUrl = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DATABASE || 'karaaslan_muzik';
-const uploadDir = path.join(__dirname, 'uploads');
+const uploadDir = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 let db;
+let mediaBucket;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -43,6 +44,45 @@ function publicUser(user) {
   return { id: user._id.toString(), username: user.username, email: user.email, avatar: user.avatar || '', bio: user.bio || '', status: user.status || '', genres: user.genres || [], profileVisibility: user.profileVisibility || 'public', isAdmin: !!user.isAdmin, theme: user.theme || 'dark' };
 }
 function safeName(name) { return String(name || 'audio').replace(/[^a-z0-9._-]/gi, '_').slice(0, 100); }
+function storeMedia(buffer, filename, contentType) {
+  return new Promise((resolve, reject) => {
+    const stream = mediaBucket.openUploadStream(filename, { metadata: { contentType } });
+    stream.once('error', reject);
+    stream.once('finish', () => resolve(stream.id));
+    stream.end(buffer);
+  });
+}
+async function removeMedia(id) {
+  if (ObjectId.isValid(id)) await mediaBucket.delete(new ObjectId(id)).catch(error => { if (error.code !== 26 && error.codeName !== 'FileNotFound') throw error; });
+}
+async function migrateLegacyMedia() {
+  const [tracks, users] = await Promise.all([
+    db.collection('tracks').find({ url: /^\/uploads\// }, { projection: { url: 1 } }).toArray(),
+    db.collection('users').find({ avatar: /^\/uploads\// }, { projection: { avatar: 1 } }).toArray()
+  ]);
+  const urls = [...new Set([...tracks.map(item => item.url), ...users.map(item => item.avatar)])];
+  const moved = new Map();
+  const contentTypes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac' };
+  for (const url of urls) {
+    const filename = safeName(path.basename(url)); const location = path.join(uploadDir, filename);
+    if (!fs.existsSync(location)) continue;
+    const contentType = contentTypes[path.extname(filename).toLowerCase()] || 'application/octet-stream';
+    const id = await storeMedia(fs.readFileSync(location), filename, contentType);
+    moved.set(url, `/media/${id.toString()}`);
+  }
+  for (const [url, nextUrl] of moved) {
+    await Promise.all([
+      db.collection('tracks').updateMany({ url }, { $set: { url: nextUrl } }),
+      db.collection('users').updateMany({ avatar: url }, { $set: { avatar: nextUrl } }),
+      db.collection('users').updateMany({ 'recentTracks.url': url }, { $set: { 'recentTracks.$[track].url': nextUrl } }, { arrayFilters: [{ 'track.url': url }] }),
+      db.collection('rooms').updateMany({ 'queue.url': url }, { $set: { 'queue.$[track].url': nextUrl } }, { arrayFilters: [{ 'track.url': url }] }),
+      db.collection('rooms').updateMany({ 'history.url': url }, { $set: { 'history.$[track].url': nextUrl } }, { arrayFilters: [{ 'track.url': url }] }),
+      db.collection('rooms').updateMany({ 'playback.track.url': url }, { $set: { 'playback.track.url': nextUrl } }),
+      db.collection('playlists').updateMany({ 'tracks.url': url }, { $set: { 'tracks.$[track].url': nextUrl } }, { arrayFilters: [{ 'track.url': url }] })
+    ]);
+  }
+  if (moved.size) console.log(`Migrated ${moved.size} legacy upload(s) into MongoDB GridFS.`);
+}
 async function notifyUser(userId, type, title, message, roomId = '') {
   if (!userId) return;
   const notification = { userId: String(userId), type, title: String(title).slice(0, 80), message: String(message).slice(0, 180), roomId, read: false, createdAt: new Date() };
@@ -137,11 +177,22 @@ app.post('/api/me/notifications/read', auth, async (req, res) => { await db.coll
 app.post('/api/me/avatar', auth, express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '2mb' }), async (req, res) => {
   if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Profil resmi gönderilmedi.' });
   const ext = ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' })[req.headers['content-type']];
-  const id = crypto.randomUUID(); const filename = `${id}${ext}`;
-  fs.writeFileSync(path.join(uploadDir, filename), req.body, { flag: 'wx' });
-  const avatar = `/uploads/${filename}`;
+  if (!ext) return res.status(415).json({ error: 'Desteklenmeyen resim biçimi.' });
+  const id = await storeMedia(req.body, `${crypto.randomUUID()}${ext}`, req.headers['content-type']);
+  const avatar = `/media/${id.toString()}`;
+  const current = await db.collection('users').findOne({ _id: new ObjectId(req.user.sub) }, { projection: { avatar: 1 } });
   await db.collection('users').updateOne({ _id: new ObjectId(req.user.sub) }, { $set: { avatar } });
+  if (current?.avatar && current.avatar !== avatar && current.avatar.startsWith('/media/')) await removeMedia(current.avatar.slice('/media/'.length)).catch(error => console.error('Old avatar cleanup failed:', error.message));
   res.json({ avatar });
+});
+app.get('/media/:id', async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) return res.status(404).end();
+  const id = new ObjectId(req.params.id); const file = await mediaBucket.find({ _id: id }).next();
+  if (!file) return res.status(404).end();
+  res.set('Content-Type', file.metadata?.contentType || 'application/octet-stream');
+  res.set('Content-Length', String(file.length));
+  res.set('Cache-Control', 'public, max-age=86400, immutable');
+  mediaBucket.openDownloadStream(id).on('error', error => { if (!res.headersSent) res.status(404).end(); else res.destroy(error); }).pipe(res);
 });
 app.get('/api/catalog', async (_req, res) => res.json(await db.collection('tracks').find({}).sort({ createdAt: -1 }).limit(500).toArray()));
 app.get('/api/rooms', async (_req, res) => {
@@ -178,7 +229,7 @@ app.delete('/api/rooms/:roomId', auth, async (req, res) => {
   if (room.hostId !== req.user.sub && !req.user.admin) return res.status(403).json({ error: 'Bu odayı yalnızca sahibi silebilir.' });
   await db.collection('rooms').deleteOne({ roomId });
   for (const socketId of io.sockets.adapter.rooms.get(roomId) || []) { const member = io.sockets.sockets.get(socketId); member?.emit('room:closed', { roomId }); member?.leave(roomId); if (member) { member.data.roomId = null; member.data.participant = null; } }
-  roomState.delete(roomId); roomPlaybackControlAt.delete(roomId); io.emit('rooms:update'); res.json({ ok: true });
+  roomState.delete(roomId); roomPlaybackControlAt.delete(roomId); roomListenStatsAt.delete(roomId); io.emit('rooms:update'); res.json({ ok: true });
 });
 app.get('/api/youtube/search', async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 100);
@@ -234,6 +285,7 @@ app.delete('/api/admin/users/:id', auth, admin, async (req, res) => {
   await db.collection('rooms').updateMany({ hostId: id.toString() }, { $set: { hostId: req.user.sub, hostName: req.user.username } });
   for (const room of ownedRooms) for (const [socketId, participant] of roomState.get(room.roomId) || []) io.to(socketId).emit('room:host', { roomId: room.roomId, hostId: req.user.sub, hostName: req.user.username, isHost: false, isDj: participant.isDj });
   io.emit('rooms:update');
+  if (user.avatar?.startsWith('/media/')) await removeMedia(user.avatar.slice('/media/'.length)).catch(error => console.error('Deleted user avatar cleanup failed:', error.message));
   res.json({ ok: true });
 });
 app.get('/api/admin/tracks', auth, admin, async (_req, res) => {
@@ -246,6 +298,7 @@ app.delete('/api/admin/tracks/:id', auth, admin, async (req, res) => {
   if (!track) return res.status(404).json({ error: 'Şarkı bulunamadı.' });
   await db.collection('tracks').deleteOne({ _id: id });
   if (typeof track.url === 'string' && track.url.startsWith('/uploads/')) { const filename = path.basename(track.url); try { fs.unlinkSync(path.join(uploadDir, filename)); } catch (error) { if (error.code !== 'ENOENT') throw error; } }
+  if (typeof track.url === 'string' && track.url.startsWith('/media/')) await removeMedia(track.url.slice('/media/'.length)).catch(error => console.error('Deleted track media cleanup failed:', error.message));
   if (track.url) {
     const rooms = await db.collection('rooms').find({ 'queue.url': track.url }).toArray();
     for (const room of rooms) { const queue = (room.queue || []).filter(item => item.url !== track.url); await db.collection('rooms').updateOne({ roomId: room.roomId }, { $set: { queue } }); io.to(room.roomId).emit('room:queue', { roomId: room.roomId, queue }); }
@@ -259,9 +312,8 @@ app.post('/api/admin/tracks', auth, admin, express.raw({ type: ['audio/mpeg', 'a
   const mime = req.headers['content-type'];
   const ext = ({ 'audio/mpeg': '.mp3', 'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/wave': '.wav', 'audio/ogg': '.ogg', 'audio/mp4': '.m4a', 'audio/x-m4a': '.m4a', 'audio/aac': '.aac', 'audio/x-aac': '.aac', 'audio/flac': '.flac', 'audio/x-flac': '.flac' })[mime];
   if (!ext) return res.status(415).json({ error: 'Desteklenmeyen ses biçimi.' });
-  const id = crypto.randomUUID();
-  fs.writeFileSync(path.join(uploadDir, id + ext), req.body, { flag: 'wx' });
-  const track = { title: String(req.query.title || 'İsimsiz şarkı').slice(0, 120), artist: String(req.query.artist || 'Bilinmeyen sanatçı').slice(0, 120), source: 'library', url: `/uploads/${id}${ext}`, createdAt: new Date() };
+  const id = await storeMedia(req.body, `${crypto.randomUUID()}${ext}`, mime);
+  const track = { title: String(req.query.title || 'İsimsiz şarkı').slice(0, 120), artist: String(req.query.artist || 'Bilinmeyen sanatçı').slice(0, 120), source: 'library', url: `/media/${id.toString()}`, createdAt: new Date() };
   const result = await db.collection('tracks').insertOne(track); res.status(201).json({ ...track, id: result.insertedId.toString() });
 });
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
@@ -277,12 +329,28 @@ function queuePlaybackWrite(roomId, work) {
   current.finally(() => { if (roomPlaybackQueues.get(roomId) === current) roomPlaybackQueues.delete(roomId); }).catch(() => {});
   return current;
 }
+function onAsyncSocket(socket, eventName, handler) {
+  socket.on(eventName, (...args) => {
+    const acknowledge = typeof args.at(-1) === 'function' ? args.at(-1) : null;
+    Promise.resolve().then(() => handler(...args)).catch(error => {
+      console.error(`Socket event ${eventName} failed:`, error.message);
+      acknowledge?.({ error: 'İşlem tamamlanamadı. Bağlantını kontrol edip yeniden dene.' });
+    });
+  });
+}
+function allowSocketEvent(socket, eventName, limit, windowMs) {
+  const now = Date.now(); socket.data.eventRates ||= new Map();
+  let bucket = socket.data.eventRates.get(eventName);
+  if (!bucket || bucket.resetAt <= now) { bucket = { count: 0, resetAt: now + windowMs }; socket.data.eventRates.set(eventName, bucket); }
+  if (bucket.count >= limit) return false;
+  bucket.count += 1; return true;
+}
 io.use(async (socket, next) => {
   try { const p = jwt.verify(socket.handshake.auth?.token || '', secret); if (!ObjectId.isValid(p.sub)) throw new Error('Invalid account'); const account = await db.collection('users').findOne({ _id: new ObjectId(p.sub) }, { projection: { username: 1, isAdmin: 1, tokenVersion: 1 } }); if (!account || (p.ver || 0) !== (account.tokenVersion || 0)) throw new Error('Account not found or session expired'); socket.user = { ...p, username: account.username, admin: !!account.isAdmin }; next(); }
   catch { next(new Error('Oturum açmanız gerekiyor.')); }
 });
 io.on('connection', socket => {
-  socket.on('room:join', async ({ roomId, username } = {}, done = () => {}) => {
+  onAsyncSocket(socket, 'room:join', async ({ roomId, username } = {}, done = () => {}) => {
     if (socket.data.roomId && socket.data.roomId !== roomId) { try { await leaveCurrentRoom(socket); } catch (error) { console.error('Room switch cleanup failed:', error.message); return done({ error: 'Önceki odadan ayrılırken bağlantı hatası oluştu.' }); } }
     roomId = String(roomId || '').trim().slice(0, 40);
     if (!/^[a-zA-Z0-9_-]{3,40}$/.test(roomId)) return done({ error: 'Oda kodu geçersiz.' });
@@ -292,15 +360,15 @@ io.on('connection', socket => {
     if (set.size >= 20 && !set.has(socket.id)) return done({ error: 'Oda dolu (en fazla 20 kişi).' });
     const dbUser = await db.collection('users').findOne({ _id: new ObjectId(socket.user.sub) });
     const participant = { id: socket.id, userId: socket.user.sub, username: dbUser?.username || username || 'Dinleyici', avatar: dbUser?.avatar || '', isAdmin: !!socket.user.admin, isHost: room.hostId === socket.user.sub, isDj: room.hostId === socket.user.sub || !!socket.user.admin || (room.djIds || []).includes(socket.user.sub), micOn: false, cameraOn: false };
-    set.set(socket.id, participant); roomState.set(roomId, set); socket.join(roomId); socket.data.roomId = roomId; socket.data.participant = participant;
     await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $pull: { recentRooms: { roomId } } });
     await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $push: { recentRooms: { $each: [{ roomId, name: room.name, mood: room.mood, joinedAt: new Date() }], $position: 0, $slice: 25 } } });
+    set.set(socket.id, participant); roomState.set(roomId, set); socket.join(roomId); socket.data.roomId = roomId; socket.data.participant = participant;
     done({ room: { roomId, name: room.name, mood: room.mood, visibility: room.visibility || 'public', hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId }, participants: [...set.values()], history: room.history || [], requests: room.requests || [], announcement: room.announcement || '', statistics: room.statistics || { plays: 0, seconds: 0 } } });
     if (room.playback?.playing) socket.emit('room:playback', { ...room.playback, roomId });
     io.to(roomId).emit('room:participants', { roomId, participants: [...set.values()] });
     io.emit('rooms:update');
   });
-  socket.on('room:queue:add', async (track, done = () => {}) => {
+  onAsyncSocket(socket, 'room:queue:add', async (track, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId) return done({ error: 'Önce odaya katıl.' });
     const set = roomState.get(roomId); const person = set?.get(socket.id); const room = await db.collection('rooms').findOne({ roomId });
     if (!room || (!person?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'Kuyruğa yalnızca oda sahibi veya DJ şarkı ekleyebilir.' });
@@ -308,8 +376,9 @@ io.on('connection', socket => {
     if (!item.title || (item.source === 'youtube' && !item.videoId) || (item.source === 'library' && !item.url)) return done({ error: 'Şarkı bilgisi geçersiz.' });
     const queue = room.queue || []; if (queue.length >= 100) return done({ error: 'Oda kuyruğu dolu.' }); queue.push(item); await db.collection('rooms').updateOne({ roomId }, { $set: { queue } }); io.to(roomId).emit('room:queue', { roomId, queue }); io.emit('rooms:update'); done({ ok: true });
   });
-  socket.on('room:request:add', async (track, done = () => {}) => {
+  onAsyncSocket(socket, 'room:request:add', async (track, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId) return done({ error: 'Önce bir odaya katıl.' });
+    if (!allowSocketEvent(socket, 'song-request', 8, 60_000)) return done({ error: 'İstekleri biraz yavaş gönder; bir dakika sonra yeniden dene.' });
     const room = await db.collection('rooms').findOne({ roomId }); if (!room) return done({ error: 'Oda bulunamadı.' });
     const item = { requestId: crypto.randomUUID(), title: String(track?.title || '').slice(0, 120), artist: String(track?.artist || '').slice(0, 120), source: track?.source === 'youtube' ? 'youtube' : 'library', videoId: String(track?.videoId || '').slice(0, 32), url: String(track?.url || '').slice(0, 500), requesterId: socket.user.sub, requester: socket.user.username, status: 'pending', requestedAt: new Date() };
     if (!item.title || (item.source === 'youtube' ? !item.videoId : !item.url)) return done({ error: 'Şarkı isteği geçersiz.' });
@@ -317,7 +386,7 @@ io.on('connection', socket => {
     const requests = [item, ...(room.requests || [])].slice(0, 50); await db.collection('rooms').updateOne({ roomId }, { $set: { requests } }); io.to(roomId).emit('room:requests', { roomId, requests });
     await Promise.all([...new Set([room.hostId, ...(room.djIds || [])])].map(userId => notifyUser(userId, 'song-request', 'Yeni şarkı isteği', `${item.requester}: ${item.title}`, roomId))); done({ ok: true });
   });
-  socket.on('room:request:resolve', async ({ requestId, accept } = {}, done = () => {}) => {
+  onAsyncSocket(socket, 'room:request:resolve', async ({ requestId, accept } = {}, done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }) : null; const participant = roomState.get(roomId)?.get(socket.id);
     if (!room || (!participant?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'İstekleri yalnızca oda sahibi veya DJ yönetebilir.' });
     const requests = room.requests || []; const request = requests.find(item => item.requestId === requestId && item.status === 'pending'); if (!request) return done({ error: 'Bekleyen istek bulunamadı.' });
@@ -327,12 +396,12 @@ io.on('connection', socket => {
     await db.collection('rooms').updateOne({ roomId }, update); io.to(roomId).emit('room:requests', { roomId, requests }); if (accept) io.to(roomId).emit('room:queue', { roomId, queue });
     await notifyUser(request.requesterId, accept ? 'request-accepted' : 'request-rejected', accept ? 'İsteğin kabul edildi' : 'İsteğin reddedildi', request.title, roomId); done({ ok: true });
   });
-  socket.on('room:announcement', async (text, done = () => {}) => {
+  onAsyncSocket(socket, 'room:announcement', async (text, done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }) : null; const participant = roomState.get(roomId)?.get(socket.id);
     if (!room || (!participant?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'Duyuruyu yalnızca oda sahibi veya DJ düzenleyebilir.' });
     const announcement = String(text || '').trim().slice(0, 180); await db.collection('rooms').updateOne({ roomId }, { $set: { announcement } }); io.to(roomId).emit('room:announcement', { roomId, announcement }); done({ ok: true });
   });
-  socket.on('room:queue:replace', async queue => {
+  onAsyncSocket(socket, 'room:queue:replace', async queue => {
     const roomId = socket.data.roomId; if (!roomId || !Array.isArray(queue) || queue.length > 100) return;
     const person = roomState.get(roomId)?.get(socket.id); const room = await db.collection('rooms').findOne({ roomId });
     if (!person?.isDj && room?.hostId !== socket.user.sub) return;
@@ -341,7 +410,7 @@ io.on('connection', socket => {
     const playback = index < 0 ? { ...(room?.playback || {}), roomId, revision: (room?.playback?.revision || 0) + 1, playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() } : { ...room.playback, roomId, revision: (room.playback?.revision || 0) + 1, index, track: sanitized[index], updatedAt: new Date(), serverTime: Date.now() };
     await db.collection('rooms').updateOne({ roomId }, { $set: { queue: sanitized, playback } }); io.to(roomId).emit('room:queue', { roomId, queue: sanitized }); io.to(roomId).emit('room:playback', playback); io.emit('rooms:update');
   });
-  socket.on('room:queue:remove', async trackId => {
+  onAsyncSocket(socket, 'room:queue:remove', async trackId => {
     const roomId = socket.data.roomId; if (!roomId) return;
     const person = roomState.get(roomId)?.get(socket.id); const room = await db.collection('rooms').findOne({ roomId });
     if (!person?.isDj && room?.hostId !== socket.user.sub) return;
@@ -350,6 +419,11 @@ io.on('connection', socket => {
     if (playback.track?.id === trackId) playback = { ...playback, roomId, revision: (playback.revision || 0) + 1, playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() };
     else if (Number.isInteger(playback.index) && removedIndex < playback.index) playback = { ...playback, roomId, revision: (playback.revision || 0) + 1, index: playback.index - 1, updatedAt: new Date(), serverTime: Date.now() };
     await db.collection('rooms').updateOne({ roomId }, { $set: { queue, playback } }); io.to(roomId).emit('room:queue', { roomId, queue }); io.to(roomId).emit('room:playback', { ...playback, roomId }); io.emit('rooms:update');
+  });
+  onAsyncSocket(socket, 'room:playback:sync', async (done = () => {}) => {
+    const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }, { projection: { playback: 1 } }) : null;
+    if (!room) return done({ error: 'Oda bağlantısı bulunamadı.' });
+    done({ playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId } });
   });
   socket.on('room:playback', (state, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId || state?.roomId !== roomId) return done({ error: 'Oda bağlantısı bulunamadı. Odaya yeniden katıl.' });
@@ -384,36 +458,39 @@ io.on('connection', socket => {
         await db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.plays': 1 }, $push: { recentTracks: { $each: [recent], $position: 0, $slice: 30 } } } } })));
         const historyEntry = { trackId: track.id, title: track.title, artist: track.artist || '', source: track.source, videoId: track.videoId || '', url: track.url || '', playedBy: socket.user.username, playedAt: playback.updatedAt };
         io.to(roomId).emit('room:history', { roomId, entry: historyEntry });
+        for (const userId of activeUsers) for (const recipient of io.of('/').sockets.values()) if (recipient.user?.sub === userId) recipient.emit('user:history', { entry: recent });
       }
       if (secondsSinceStats >= 15 && playback.playing) await db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.seconds': 15 } } } })));
       if (trackChanged || (secondsSinceStats >= 15 && playback.playing)) io.to(roomId).emit('room:stats', { roomId, statistics: { plays: (room.statistics?.plays || 0) + (trackChanged ? 1 : 0), seconds: (room.statistics?.seconds || 0) + (secondsSinceStats >= 15 && playback.playing ? 15 : 0) } });
       io.to(roomId).emit('room:playback', playback); return { ok: true, revision: playback.revision };
     }).then(result => done(result || { ok: true })).catch(error => { console.error('Playback sync failed:', error.message); done({ error: 'Oynatma güncellenemedi. Tekrar dene.' }); });
   });
-  socket.on('room:dj:assign', async (userId, done = () => {}) => {
+  onAsyncSocket(socket, 'room:dj:assign', async (userId, done = () => {}) => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
     if (room?.hostId !== socket.user.sub && !socket.user.admin) return done({ error: 'DJ yetkisini yalnızca oda sahibi verebilir.' });
-    const targets = []; for (const [id, p] of set || []) { if (p.userId === userId && p.userId !== room.hostId) { p.isDj = true; targets.push(id); } }
+    const targets = []; for (const [id, p] of set || []) if (p.userId === userId && p.userId !== room.hostId) targets.push(id);
     const assigned = targets.length > 0;
     if (!assigned) return done({ error: 'Bu kullanıcı şu anda odada değil.' });
     await db.collection('rooms').updateOne({ roomId }, { $addToSet: { djIds: String(userId) } });
+    for (const id of targets) set.get(id).isDj = true;
     for (const id of targets) io.to(id).emit('room:role', { roomId, isDj: true });
     io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] });
     await notifyUser(userId, 'dj-assigned', 'DJ yetkisi verildi', room.name, roomId);
     done({ ok: true });
   });
-  socket.on('room:dj:revoke', async (userId, done = () => {}) => {
+  onAsyncSocket(socket, 'room:dj:revoke', async (userId, done = () => {}) => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
     if (room?.hostId !== socket.user.sub && !socket.user.admin) return done({ error: 'DJ yetkisini yalnızca oda sahibi kaldırabilir.' });
-    const targets = []; for (const [id, p] of set || []) if (p.userId === userId && p.userId !== room.hostId) { p.isDj = false; targets.push(id); }
+    const targets = []; for (const [id, p] of set || []) if (p.userId === userId && p.userId !== room.hostId) targets.push(id);
     const revoked = targets.length > 0;
     if (!revoked) return done({ error: 'Bu kullanıcı DJ değil veya artık odada değil.' });
     await db.collection('rooms').updateOne({ roomId }, { $pull: { djIds: String(userId) } });
+    for (const id of targets) set.get(id).isDj = false;
     for (const id of targets) io.to(id).emit('room:role', { roomId, isDj: false });
     io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] });
     done({ ok: true });
   });
-  socket.on('room:dj:handoff', async (userId, done = () => {}) => {
+  onAsyncSocket(socket, 'room:dj:handoff', async (userId, done = () => {}) => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = roomId ? await db.collection('rooms').findOne({ roomId }) : null; const actor = set?.get(socket.id);
     if (!room || (!actor?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'DJ devrini yalnızca oda sahibi veya DJ yapabilir.' });
     const target = [...(set?.values() || [])].find(person => person.userId === userId); if (!target || target.userId === room.hostId) return done({ error: 'DJ devri için odada bir üye seç.' });
@@ -424,13 +501,13 @@ io.on('connection', socket => {
     io.to(roomId).emit('room:participants', { roomId, participants: [...set.values()] });
     await notifyUser(userId, 'dj-handoff', 'DJ kontrolü sana devredildi', room.name, roomId); done({ ok: true });
   });
-  socket.on('room:kick', async userId => {
+  onAsyncSocket(socket, 'room:kick', async userId => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
     if (!room || (room.hostId !== socket.user.sub && !socket.user.admin) || userId === room.hostId) return;
     for (const [id, p] of set || []) if (p.userId === userId) { io.to(id).emit('room:kicked', { roomId }); const target = io.sockets.sockets.get(id); if (target) { target.leave(roomId); target.data.roomId = null; target.data.participant = null; } set.delete(id); }
     io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] }); io.emit('rooms:update');
   });
-  socket.on('room:host:transfer', async userId => {
+  onAsyncSocket(socket, 'room:host:transfer', async userId => {
     const roomId = socket.data.roomId; const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
     if (!room || room.hostId !== socket.user.sub || ![...(set?.values() || [])].some(p => p.userId === userId)) return;
     const next = [...set.values()].find(p => p.userId === userId); if (!next) return;
@@ -439,9 +516,10 @@ io.on('connection', socket => {
     for (const [id, p] of set) { p.isHost = p.userId === userId; p.isDj = p.isHost || !!p.isAdmin || assignedDjs.includes(String(p.userId)); io.to(id).emit('room:host', { roomId, hostId: userId, hostName: next.username, isHost: p.isHost, isDj: p.isDj }); }
     io.to(roomId).emit('room:participants', { roomId, participants: [...set.values()] }); io.emit('rooms:update');
   });
-  socket.on('room:chat', ({ text } = {}) => {
-    const message = String(text || '').trim().slice(0, 500); if (!message || !socket.data.roomId) return;
-    io.to(socket.data.roomId).emit('room:chat', { roomId: socket.data.roomId, id: crypto.randomUUID(), username: socket.data.participant.username, text: message, at: new Date().toISOString() });
+  socket.on('room:chat', ({ text } = {}, done = () => {}) => {
+    const message = String(text || '').trim().slice(0, 500); if (!message || !socket.data.roomId) return done({ error: 'Mesaj boş veya oda bağlantısı yok.' });
+    if (!allowSocketEvent(socket, 'chat', 8, 5_000)) return done({ error: 'Sohbete çok hızlı mesaj gönderiyorsun. Biraz bekle.' });
+    io.to(socket.data.roomId).emit('room:chat', { roomId: socket.data.roomId, id: crypto.randomUUID(), username: socket.data.participant.username, text: message, at: new Date().toISOString() }); done({ ok: true });
   });
   socket.on('room:media', ({ micOn, cameraOn } = {}) => {
     const roomId = socket.data.roomId; const participant = roomState.get(roomId)?.get(socket.id); if (!participant) return;
@@ -455,7 +533,7 @@ io.on('connection', socket => {
 async function leaveCurrentRoom(socket) {
   const roomId = socket.data.roomId; if (!roomId) return;
   const set = roomState.get(roomId); set?.delete(socket.id); socket.leave(roomId); socket.data.roomId = null;
-  if (!set?.size) roomState.delete(roomId);
+  if (!set?.size) { roomState.delete(roomId); roomPlaybackControlAt.delete(roomId); roomListenStatsAt.delete(roomId); }
   io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] });
   io.emit('rooms:update');
 }
@@ -469,7 +547,7 @@ app.use((error, _req, res, _next) => {
 async function start() {
   if (!secret || secret.length < 32) throw new Error('JWT_SECRET en az 32 karakterlik gizli bir değer olmalı.');
   if (!mongoUrl) throw new Error('MONGODB_URI .env içinde tanımlanmalı.');
-  const client = new MongoClient(mongoUrl); await client.connect(); db = client.db(dbName);
+  const client = new MongoClient(mongoUrl); await client.connect(); db = client.db(dbName); mediaBucket = new GridFSBucket(db);
   await db.createCollection('users').catch(error => { if (error.codeName !== 'NamespaceExists') throw error; });
   const users = db.collection('users');
   const indexes = await users.listIndexes().toArray();
@@ -482,6 +560,7 @@ async function start() {
   await users.createIndex({ username: 1 }, { unique: true, collation: { locale: 'en', strength: 2 }, partialFilterExpression: { username: { $type: 'string' } } });
   await users.createIndex({ email: 1 }, { unique: true, partialFilterExpression: { email: { $type: 'string' } } });
   await db.collection('rooms').createIndex({ roomId: 1 }, { unique: true });
+  await migrateLegacyMedia();
   let bootstrapAdmin = await db.collection('users').findOne({ bootstrapAdmin: true });
   if (!bootstrapAdmin && process.env.ADMIN_USERNAME && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD !== 'change-this-before-first-run') {
     const username = process.env.ADMIN_USERNAME.trim();

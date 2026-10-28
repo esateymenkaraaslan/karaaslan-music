@@ -2,7 +2,7 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const savedToken = localStorage.getItem('km_token') || sessionStorage.getItem('km_token') || '';
 if (savedToken && !localStorage.getItem('km_token') && sessionStorage.getItem('km_remember') !== '0') localStorage.setItem('km_token', savedToken);
-const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
+const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
 const api = async (url, options = {}) => {
   const headers = { ...(options.body && !(options.body instanceof Blob) && !(options.body instanceof ArrayBuffer) ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
@@ -54,6 +54,7 @@ function connectSocket() {
   if (!state.socketConfigured) {
     state.socket.on('rooms:update', () => refreshRooms());
     state.socket.on('notification:new', notification => { state.notifications.unshift(notification); renderNotifications(); toast(notification.title); });
+    state.socket.on('user:history', () => { if (!$('#profileView').classList.contains('hidden')) loadProfileActivity(); });
     state.socket.on('connect', () => { refreshRooms(); if (state.socketConnectedBefore && state.room) enterRoom(state.room.roomId); state.socketConnectedBefore = true; });
     state.socketConfigured = true;
   }
@@ -81,7 +82,7 @@ function enterRoom(roomId) {
   state.socket.emit('room:join', { roomId }, response => {
     if (roomEpoch !== state.roomEpoch) return;
     if (response?.error) { toast(response.error); return; }
-    state.room = response.room; state.queue = response.room.queue || []; state.participants = response.room.participants || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; renderRoomFeatures();
+    state.room = response.room; state.queue = response.room.queue || []; state.participants = response.room.participants || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.playbackNeedsGesture = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; renderRoomFeatures();
     $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); $('#roomVisibility').textContent = response.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
     state.socket.off('room:queue').on('room:queue', update => { if (!state.room || update?.roomId !== state.room.roomId) return; const queue = update.queue || []; const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
     state.socket.off('room:participants').on('room:participants', update => { if (!state.room || update?.roomId !== state.room.roomId) return; state.participants = update.participants || []; renderParticipants(); renderRoomFeatures(); syncPeers(state.participants); });
@@ -112,7 +113,7 @@ function renderParticipants() {
   $('#voiceParticipants').innerHTML = state.participants.map(p => `<span class="voice-person">${escapeHtml(p.username)}${p.micOn ? ' · MIC' : ''}${p.cameraOn ? ' · CAM' : ''}</span>`).join('');
 }
 function renderPlaybackPermissions() {
-  ['#playBtn', '#prevBtn', '#nextBtn', '#shuffleBtn', '#repeatBtn', '#clearQueue', '#announceBtn'].forEach(selector => { const button = $(selector); if (button) { button.disabled = !state.isDj; button.title = state.isDj ? (button.dataset.djTitle || button.title) : 'Yalnızca oda sahibi veya DJ kullanabilir'; } });
+  ['#playBtn', '#prevBtn', '#nextBtn', '#shuffleBtn', '#repeatBtn', '#clearQueue', '#announceBtn'].forEach(selector => { const button = $(selector); if (button) { const localResume = selector === '#playBtn' && state.playbackNeedsGesture; button.disabled = !state.isDj && !localResume; button.title = localResume ? 'Bu cihazda dinlemeyi başlat' : state.isDj ? (button.dataset.djTitle || button.title) : 'Yalnızca oda sahibi veya DJ kullanabilir'; } });
   $$('#queueList [data-play-index], #queueList [data-remove-track]').forEach(button => { button.disabled = !state.isDj; if (!state.isDj) button.title = 'Yalnızca oda sahibi veya DJ kullanabilir'; });
   $$('#searchResults [data-add-track]').forEach(button => { button.disabled = false; button.title = state.isDj ? 'Kuyruğa ekle' : 'DJ’ye şarkı isteği gönder'; });
   $$('.player-controls input[type="range"]').forEach(input => { if (input.id === 'seekBar') input.disabled = !state.isDj; });
@@ -151,7 +152,14 @@ async function searchTracks() {
 }
 function parseYouTube(value) { try { const u = new URL(value); const host = u.hostname.replace(/^www\./, '').toLowerCase(); if (!['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(host)) return ''; let id = host === 'youtu.be' ? u.pathname.slice(1) : u.searchParams.get('v'); if (host !== 'youtu.be' && u.pathname.startsWith('/embed/')) id = u.pathname.split('/')[2]; return /^[A-Za-z0-9_-]{11}$/.test(id || '') ? id : ''; } catch { return ''; } }
 async function ytSearchId(videoId) {
-  if (!state.ytReady) await new Promise(resolve => { const timeout = setTimeout(resolve, 5000); window.onYouTubeIframeAPIReady = () => { state.ytReady = true; clearTimeout(timeout); resolve(); }; const script = document.createElement('script'); script.src = 'https://www.youtube.com/iframe_api'; document.head.append(script); });
+  if (window.YT?.Player) { state.ytReady = true; return videoId; }
+  if (!state.ytReady) await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('YouTube oynatıcı yüklenemedi. Bağlantını kontrol edip yeniden dene.')), 10_000);
+    window.onYouTubeIframeAPIReady = () => { state.ytReady = true; clearTimeout(timeout); resolve(); };
+    let script = document.getElementById('youtube-iframe-api');
+    if (!script) { script = document.createElement('script'); script.id = 'youtube-iframe-api'; script.src = 'https://www.youtube.com/iframe_api'; script.onerror = () => { clearTimeout(timeout); reject(new Error('YouTube oynatıcı yüklenemedi.')); }; document.head.append(script); }
+  });
+  if (!window.YT?.Player) throw new Error('YouTube oynatıcı hazır değil. Biraz sonra yeniden dene.');
   return videoId;
 }
 async function playAt(index) {
@@ -159,25 +167,39 @@ async function playAt(index) {
   if (index < 0 || index >= state.queue.length) return;
   const epoch = state.roomEpoch;
   const item = state.queue[index]; state.selectedTrack = index; state.localTrack = null; $('#playerPlaceholder').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#ytPlayer').classList.remove('hidden'); $('#nowTitle').textContent = item.title; $('#nowArtist').textContent = item.artist || '';
-  await loadTrackMedia(item, 0, true);
+  if (await loadTrackMedia(item, 0, true) === false) return;
   if (epoch !== state.roomEpoch) return;
   state.queueLocked = true; syncPlayback(); renderQueue();
+}
+function requirePlaybackGesture() {
+  state.playbackNeedsGesture = true;
+  $('#playBtn').textContent = '▶';
+  renderPlaybackPermissions();
+  toast('Tarayıcı bu cihazda otomatik oynatmayı durdurdu. Dinlemeye devam etmek için oynat düğmesine dokun.');
+}
+function clearPlaybackGesture() {
+  state.playbackNeedsGesture = false;
+  renderPlaybackPermissions();
 }
 async function loadTrackMedia(item, position = 0, shouldPlay = true) {
   const epoch = state.roomEpoch; const roomId = state.room?.roomId;
   state.activeTrackId = item.id;
   $('#playerPlaceholder').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#nowTitle').textContent = item.title || 'Şarkı'; $('#nowArtist').textContent = item.artist || '';
   if (item.source === 'youtube') {
-    $('#ytPlayer').classList.remove('hidden'); await ytSearchId(item.videoId);
-    if (epoch !== state.roomEpoch || roomId !== state.room?.roomId) return;
+    $('#ytPlayer').classList.remove('hidden');
+    try { await ytSearchId(item.videoId); } catch (error) { toast(error.message); return false; }
+    if (epoch !== state.roomEpoch || roomId !== state.room?.roomId) return false;
     state.pendingYoutube = { epoch, roomId, trackId: item.id, videoId: item.videoId, position: Math.max(0, position || 0), playing: !!shouldPlay };
-    if (!state.youtube) state.youtube = new YT.Player('ytPlayer', { height: '240', width: '100%', videoId: item.videoId, playerVars: { playsinline: 1, origin: location.origin, controls: 0, disablekb: 1, rel: 0 }, events: { onReady: () => { state.ytPlayerReady = true; applyPendingYoutube(); }, onStateChange: e => { if (e.data === YT.PlayerState.ENDED && state.activeTrackId === state.queue[state.selectedTrack]?.id) nextTrack(); }, onError: () => toast('Bu YouTube videosu oynatılamıyor.'), onAutoplayBlocked: () => toast('Tarayıcı oynatmayı engelledi; oynat düğmesine dokun.') } });
-    else if (state.ytPlayerReady) applyPendingYoutube();
+    try {
+      if (!state.youtube) state.youtube = new YT.Player('ytPlayer', { height: '240', width: '100%', videoId: item.videoId, playerVars: { playsinline: 1, origin: location.origin, controls: 0, disablekb: 1, rel: 0 }, events: { onReady: () => { state.ytPlayerReady = true; applyPendingYoutube(); }, onStateChange: e => { if (e.data === YT.PlayerState.ENDED && state.activeTrackId === state.queue[state.selectedTrack]?.id) nextTrack(); }, onError: () => toast('Bu YouTube videosu oynatılamıyor.'), onAutoplayBlocked: requirePlaybackGesture } });
+      else if (state.ytPlayerReady) applyPendingYoutube();
+    } catch (error) { toast(`YouTube oynatıcı başlatılamadı: ${error.message}`); return false; }
   } else {
     if (epoch !== state.roomEpoch || roomId !== state.room?.roomId) return;
-    state.pendingYoutube = null; state.youtube?.stopVideo?.(); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.remove('hidden'); $('#localNowTitle').textContent = item.title; $('#localNowArtist').textContent = item.artist || ''; const audio = $('#localAudio'); if (audio.src !== new URL(item.url, location.href).href) audio.src = item.url; audio.currentTime = position || 0; if (shouldPlay) await audio.play().catch(() => {}); else audio.pause();
+    state.pendingYoutube = null; state.youtube?.stopVideo?.(); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.remove('hidden'); $('#localNowTitle').textContent = item.title; $('#localNowArtist').textContent = item.artist || ''; const audio = $('#localAudio'); if (audio.src !== new URL(item.url, location.href).href) audio.src = item.url; audio.currentTime = position || 0; if (shouldPlay) await audio.play().then(clearPlaybackGesture).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); }); else audio.pause();
   }
   $('#playBtn').textContent = shouldPlay ? 'Ⅱ' : '▶';
+  return true;
 }
 function applyPendingYoutube() {
   const pending = state.pendingYoutube;
@@ -190,7 +212,14 @@ function applyPendingYoutube() {
 function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
 function syncPlayback(playing = true) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position: playerPosition(), index: state.selectedTrack, track: state.queue[state.selectedTrack], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); $('#playBtn').textContent = playing ? 'Ⅱ' : '▶'; }
 function togglePlayback() {
-  if (!state.isDj) return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
+  if (!state.isDj) {
+    if (!state.playbackNeedsGesture) return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
+    const track = state.queue[state.selectedTrack]; if (!track) return;
+    const playback = state.lastPlayback || {}; const target = Math.max(0, Number(playback.position) || 0) + (playback.playing ? Math.max(0, (Date.now() - (playback.serverTime || Date.now())) / 1000) : 0);
+    if (track.source === 'youtube') { state.youtube?.seekTo(target, true); state.youtube?.playVideo(); clearPlaybackGesture(); }
+    else { const audio = $('#localAudio'); audio.currentTime = target; audio.play().then(clearPlaybackGesture).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); }); }
+    return;
+  }
   if (state.selectedTrack == null) return state.queue.length ? playAt(0) : toast('Önce kuyruğa bir şarkı ekle.');
   const track = state.queue[state.selectedTrack]; if (!track) { clearPlaybackSurface(); return toast('Bu odanın kuyruğu boş.'); }
   const currentlyPlaying = track.source === 'youtube' && (state.pendingYoutube?.trackId === track.id ? state.pendingYoutube.playing : !!state.youtube && !!window.YT && state.youtube.getPlayerState?.() === window.YT.PlayerState.PLAYING);
@@ -200,9 +229,11 @@ function togglePlayback() {
   else if (playing) $('#localAudio').play().catch(() => {}); else $('#localAudio').pause();
   syncPlayback(playing);
 }
-function applyPlayback(playback) {
+function applyPlayback(playback, force = false) {
   if (!playback || (playback.roomId && playback.roomId !== state.room?.roomId)) return;
-  if (Number.isInteger(playback.revision) && playback.revision <= (state.lastPlaybackRevision || 0)) return;
+  if (!force && Number.isInteger(playback.revision) && playback.revision <= (state.lastPlaybackRevision || 0)) return;
+  state.lastPlayback = playback;
+  if (!playback.playing) clearPlaybackGesture();
   if (Number.isInteger(playback.revision)) state.lastPlaybackRevision = playback.revision;
   if (!playback.track && playback.index == null) { state.selectedTrack = null; state.activeTrackId = null; state.pendingYoutube = null; $('#localAudio').pause(); state.youtube?.stopVideo?.(); $('#playerPlaceholder').classList.remove('hidden'); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#playBtn').textContent = '▶'; $('#nowTitle').textContent = 'Henüz şarkı seçilmedi'; $('#nowArtist').textContent = 'Sıradan bir parça seçerek başlayın'; return; }
   const track = playback.track || state.queue[playback.index ?? state.selectedTrack]; if (!track) return;
@@ -214,7 +245,7 @@ function applyPlayback(playback) {
   const mediaMismatch = current.source === 'youtube' ? !state.youtube || state.activeTrackId !== current.id : $('#localAudio').src !== new URL(current.url || '/', location.href).href;
   if (mediaMismatch) { state.activeTrackId = current.id; loadTrackMedia(current, target, !!playback.playing); return; }
   if (current.source === 'youtube' && state.youtube) { if (Math.abs((state.youtube.getCurrentTime?.() || 0) - target) > 1.5) state.youtube.seekTo(target, true); playback.playing ? state.youtube.playVideo() : state.youtube.pauseVideo(); }
-  else if (current.source === 'library') { const audio = $('#localAudio'); if (Math.abs(audio.currentTime - target) > 1.5) audio.currentTime = target; playback.playing ? audio.play().catch(() => {}) : audio.pause(); }
+  else if (current.source === 'library') { const audio = $('#localAudio'); if (Math.abs(audio.currentTime - target) > 1.5) audio.currentTime = target; playback.playing ? audio.play().then(clearPlaybackGesture).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); }) : audio.pause(); }
   $('#playBtn').textContent = playback.playing ? 'Ⅱ' : '▶'; renderQueue();
 }
 function updateRepeatButton() { const button = $('#repeatBtn'); if (!button) return; button.dataset.mode = state.repeat; button.title = `Tekrar: ${{ off: 'Kapalı', all: 'Tüm sıra', one: 'Tek şarkı' }[state.repeat]}`; button.classList.toggle('active', state.repeat !== 'off'); }
@@ -356,7 +387,7 @@ async function toggleCamera() {
   } catch (e) { toast(mediaErrorMessage(e, 'Kamera')); }
 }
 function clearPlaybackSurface() {
-  state.selectedTrack = null; state.activeTrackId = null; state.pendingYoutube = null; state.localTrack = null; state.queueLocked = false;
+  state.selectedTrack = null; state.activeTrackId = null; state.pendingYoutube = null; state.localTrack = null; state.queueLocked = false; state.lastPlayback = null; state.playbackNeedsGesture = false;
   $('#localAudio').pause(); $('#localAudio').removeAttribute('src'); $('#localAudio').load(); state.youtube?.stopVideo?.();
   $('#playerPlaceholder').classList.remove('hidden'); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.add('hidden');
   $('#nowTitle').textContent = 'Henüz şarkı seçilmedi'; $('#nowArtist').textContent = 'Sıradan bir parça seçerek başlayın'; $('#playBtn').textContent = '▶';
@@ -384,7 +415,7 @@ $('#backHome').onclick = () => { leaveRoom(); location.hash = '#home'; }; $('#pr
 async function editCurrentRoom() { if (!state.room || (!state.isHost && !state.user?.isAdmin)) return toast('Odayı yalnızca sahibi düzenleyebilir.'); const name = prompt('Oda adı:', state.room.name || ''); if (name === null) return; const mood = prompt('Oda türü:', state.room.mood || 'Serbest dinleme'); if (mood === null) return; const visibility = confirm('Tamam: herkese açık yap. İptal: özel oda yap.') ? 'public' : 'private'; try { const updated = await api(`/api/rooms/${encodeURIComponent(state.room.roomId)}`, { method: 'PATCH', body: JSON.stringify({ name, mood, visibility }) }); Object.assign(state.room, updated); $('#roomTitle').textContent = state.room.name; $('#roomVisibility').textContent = visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; toast('Oda bilgileri güncellendi.'); } catch (e) { toast(e.message); } }
 async function deleteRoom(roomId = state.room?.roomId) { if (!roomId || !confirm('Bu oda ve kuyruğu kalıcı olarak silinsin mi?')) return; try { await api(`/api/rooms/${encodeURIComponent(roomId)}`, { method: 'DELETE' }); toast('Oda silindi.'); if (state.room?.roomId === roomId) leaveRoom(); refreshRooms(); } catch (e) { toast(e.message); } }
 $('#roomMore').onclick = editCurrentRoom; $('#editRoom').onclick = editCurrentRoom; $('#deleteRoom').onclick = () => deleteRoom(); $('#inviteBtn').onclick = $('#roomInviteIcon').onclick = async () => { const url = `${location.origin}/?room=${state.room?.roomId || ''}`; try { await navigator.clipboard.writeText(url); toast('Davet bağlantısı kopyalandı.'); } catch { toast(`Oda kodu: ${state.room?.roomId}`); } }; $('#copyCode').onclick = () => navigator.clipboard.writeText(state.room?.roomId || '').then(() => toast('Oda kodu kopyalandı.')).catch(() => {});
-$$('.room-tab').forEach(tab => tab.onclick = () => selectTab(tab.dataset.tab)); $('#chatForm').onsubmit = e => { e.preventDefault(); const text = $('#chatInput').value.trim(); if (text) { state.socket.emit('room:chat', { text }); $('#chatInput').value = ''; } };
+$$('.room-tab').forEach(tab => tab.onclick = () => selectTab(tab.dataset.tab)); $('#chatForm').onsubmit = e => { e.preventDefault(); const text = $('#chatInput').value.trim(); if (text) { state.socket.emit('room:chat', { text }, result => { if (result?.error) toast(result.error); }); $('#chatInput').value = ''; } };
 $$('.source-option').forEach(button => button.onclick = () => { state.source = button.dataset.source; $$('.source-option').forEach(b => b.classList.toggle('active', b === button)); $('#trackSearch').placeholder = state.source === 'youtube' ? 'Şarkı veya sanatçı...' : 'Katalogda ara...'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; });
 $('#searchBtn').onclick = searchTracks; $('#trackSearch').onkeydown = e => { if (e.key === 'Enter') searchTracks(); };
 $('#pasteLink').onclick = () => { const value = prompt('YouTube şarkı veya video bağlantısını yapıştır:'); if (!value) return; const id = parseYouTube(value); if (!id) return toast('Geçerli bir YouTube bağlantısı değil.'); const title = prompt('Şarkı adı (isteğe bağlı):') || 'YouTube parçası'; addTrack({ title, artist: 'YouTube', source: 'youtube', videoId: id }); };
@@ -392,6 +423,16 @@ $('#playBtn').onclick = togglePlayback; $('#nextBtn').onclick = () => nextTrack(
 $('#enableRemoteAudio').onclick = async () => { let failed = false; for (const audio of document.querySelectorAll('[data-remote-audio]')) { try { await audio.play(); } catch { failed = true; } } $('#enableRemoteAudio').classList.toggle('hidden', !failed); if (!failed) toast('Karşı tarafın sesi açıldı.'); };
 $('#localAudio').ontimeupdate = () => { if (state.localTrack || state.queue[state.selectedTrack]?.source === 'library') { const a = $('#localAudio'); $('#currentTime').textContent = fmt(a.currentTime); $('#duration').textContent = fmt(a.duration); $('#seekBar').value = a.duration ? a.currentTime / a.duration * 100 : 0; } };
 $('#localAudio').onended = () => nextTrack();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !state.room || !state.socket?.connected) return;
+  const track = state.queue[state.selectedTrack];
+  if (state.isDj && track && (track.source !== 'youtube' || state.ytPlayerReady)) {
+    const playing = track.source === 'youtube' ? state.youtube?.getPlayerState?.() === window.YT?.PlayerState?.PLAYING : !$('#localAudio').paused;
+    syncPlayback(playing);
+    return;
+  }
+  state.socket.emit('room:playback:sync', result => { if (result?.playback) applyPlayback(result.playback, true); });
+});
 function fmt(value) { if (!Number.isFinite(value)) return '0:00'; return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`; }
 setInterval(() => {
   const track = state.queue[state.selectedTrack]; if (!track) return;
