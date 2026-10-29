@@ -2,7 +2,8 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const savedToken = localStorage.getItem('km_token') || sessionStorage.getItem('km_token') || '';
 if (savedToken && !localStorage.getItem('km_token') && sessionStorage.getItem('km_remember') !== '0') localStorage.setItem('km_token', savedToken);
-const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
+const ACTIVE_ROOM_KEY = 'km_active_room';
+const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], playlistRequest: 0, roomRefreshRequest: 0, room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
 const api = async (url, options = {}) => {
   const headers = { ...(options.body && !(options.body instanceof Blob) && !(options.body instanceof ArrayBuffer) ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
@@ -21,11 +22,14 @@ function setAuthHeader() {
   else { $('#loginOpen').classList.remove('hidden'); $('#registerOpen').classList.remove('hidden'); $('#userMenu').classList.add('hidden'); }
 }
 async function refreshRooms() {
+  const requestId = ++state.roomRefreshRequest;
   try { state.rooms = await api('/api/rooms'); } catch { state.rooms = []; }
+  if (requestId !== state.roomRefreshRequest) return;
   const favoriteRooms = state.user?.favoriteRooms || [];
   state.rooms = state.rooms.map(room => ({ ...room, favorite: favoriteRooms.includes(room.roomId) }));
   const visibleRooms = state.rooms;
   if (state.user) { try { state.myRooms = await api('/api/me/rooms'); } catch { state.myRooms = []; } } else state.myRooms = [];
+  if (requestId !== state.roomRefreshRequest) return;
   const open = visibleRooms.filter(room => room.participants > 0).slice(0, 6);
   const grid = $('#roomsGrid');
   grid.innerHTML = `<article class="room-card create-card"><div class="create-plus">＋</div><h3>İlk odayı sen aç</h3><p>Arkadaşlarını davet et, dinleme sırasını birlikte oluşturun.</p><button class="button button-outline" id="cardCreate">Oda oluştur <span>↗</span></button></article>` + (open.length ? open.map((room, i) => `<article class="room-card sample-room"><div class="room-cover ${i % 2 ? 'cover-blue' : 'cover-sunset'}"><span class="cover-label">${escapeHtml(room.mood || 'BİRLİKTE DİNLE')}</span><span class="cover-disc">♫</span></div><div class="room-card-body"><div class="room-title-row"><div><span class="room-live"><i></i> CANLI</span><h3>${escapeHtml(room.name)}</h3></div><span class="room-lock">◉</span></div><div class="room-meta"><span>${room.participants} dinleyici</span><span class="meta-sep">·</span><span>${room.queueCount} parça sırada</span></div><button class="button button-join" data-join="${escapeHtml(room.roomId)}">Odaya katıl <span>→</span></button></div></article>`).join('') : `<div class="room-empty-message">Şu anda açık oda yok. İlk odayı sen aç.</div>`);
@@ -36,6 +40,8 @@ async function refreshRooms() {
   $('#myRooms').innerHTML = myRooms;
   $$('[data-side-room]').forEach(button => button.addEventListener('click', () => enterRoom(button.dataset.sideRoom)));
 }
+let roomsRefreshTimer;
+function scheduleRoomsRefresh() { clearTimeout(roomsRefreshTimer); roomsRefreshTimer = setTimeout(() => refreshRooms(), 450); }
 function modalAuth(mode) {
   const next = state.pendingRoom ? `/?room=${encodeURIComponent(state.pendingRoom)}` : `${location.pathname}${location.search}${location.hash}`;
   const target = new URL('/auth.html', location.origin); target.searchParams.set('mode', mode === 'register' ? 'register' : 'login'); target.searchParams.set('next', next); location.assign(target);
@@ -52,13 +58,14 @@ function connectSocket() {
   if (!state.token) throw new Error('Odaya katılmak için önce giriş yap.');
   if (!state.socket) { state.socket = io({ auth: { token: state.token } }); state.socketConfigured = false; state.socket.on('connect_error', err => { if (state.token) toast(err.message || 'Canlı bağlantı kurulamadı.'); }); state.socket.on('auth:revoked', () => { leaveRoom(); state.socket?.disconnect(); state.socket = null; state.socketConfigured = false; state.token = ''; state.user = null; localStorage.removeItem('km_token'); sessionStorage.removeItem('km_token'); sessionStorage.removeItem('km_remember'); setAuthHeader(); toast('Hesap oturumu sona erdi. Yeniden giriş yap.'); }); }
   if (!state.socketConfigured) {
-    state.socket.on('rooms:update', () => refreshRooms());
+    state.socket.on('rooms:update', scheduleRoomsRefresh);
     state.socket.on('catalog:update', () => {
       if (state.source === 'library' && $('#trackSearch').value.trim()) searchTracks();
       if (state.user?.isAdmin && !$('#adminCatalogPane').classList.contains('hidden')) loadAdminTracks();
     });
     state.socket.on('notification:new', notification => { state.notifications.unshift(notification); renderNotifications(); toast(notification.title); });
     state.socket.on('user:history', () => { if (!$('#profileView').classList.contains('hidden')) loadProfileActivity(); });
+    state.socket.on('user:stats', () => { if (!$('#profileView').classList.contains('hidden')) loadProfileActivity(); });
     state.socket.on('room:session:replaced', event => {
       if (event?.roomId !== state.room?.roomId) return;
       leaveRoom({ notifyServer: false });
@@ -90,7 +97,8 @@ function enterRoom(roomId) {
   try { connectSocket(); } catch (e) { toast(e.message); return; }
   state.socket.emit('room:join', { roomId }, response => {
     if (roomEpoch !== state.roomEpoch) return;
-    if (response?.error) { toast(response.error); return; }
+    if (response?.error) { if (sessionStorage.getItem(ACTIVE_ROOM_KEY) === roomId) sessionStorage.removeItem(ACTIVE_ROOM_KEY); toast(response.error); return; }
+    sessionStorage.setItem(ACTIVE_ROOM_KEY, roomId);
     state.room = response.room; state.queue = response.room.queue || []; state.participants = uniqueParticipants(response.room.participants || []); state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.playbackNeedsGesture = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; renderRoomFeatures();
     $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); $('#roomVisibility').textContent = response.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
     state.socket.off('room:queue').on('room:queue', update => { if (!state.room || update?.roomId !== state.room.roomId) return; const queue = update.queue || []; const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
@@ -288,7 +296,7 @@ async function loadProfileActivity() {
     $('#profileHistory').innerHTML = activity.recentTracks?.length ? activity.recentTracks.map(item => `<article class="activity-row"><div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.artist || '—')} · ${new Date(item.playedAt).toLocaleDateString('tr-TR')}</span></div></article>`).join('') : '<p class="activity-empty">Dinleme geçmişin burada birikecek.</p>';
     const favorites = state.myRooms.filter(room => room.favorite); $('#profileFavorites').innerHTML = favorites.length ? favorites.map(room => `<article class="activity-row"><div><b>${escapeHtml(room.name)}</b><span>${escapeHtml(room.mood || '')} · ${room.participants} dinleyici</span></div><button class="button button-outline" data-favorite-join="${escapeHtml(room.roomId)}">Katıl</button></article>`).join('') : '<p class="activity-empty">Henüz favori oda eklemedin.</p>';
     $$('[data-favorite-join]').forEach(button => button.onclick = () => enterRoom(button.dataset.favoriteJoin));
-    state.playlists = await api('/api/me/playlists'); renderPlaylists();
+    const playlistRequest = ++state.playlistRequest; const playlists = await api('/api/me/playlists'); if (playlistRequest === state.playlistRequest) { state.playlists = playlists; renderPlaylists(); }
   } catch (error) { toast(error.message); }
 }
 function renderPlaylists() {
@@ -407,6 +415,8 @@ function clearPlaybackSurface() {
   state.repeat = 'off'; state.shuffle = false; updateRepeatButton(); $('#shuffleBtn').classList.remove('active');
 }
 function leaveRoom({ notifyServer = true, navigate = true } = {}) {
+  sessionStorage.removeItem(ACTIVE_ROOM_KEY);
+  const cleanUrl = new URL(location.href); cleanUrl.searchParams.delete('room'); history.replaceState(history.state, '', `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`);
   state.roomEpoch += 1; state.voiceStream?.getTracks().forEach(t => t.stop()); state.cameraStream?.getTracks().forEach(t => t.stop());
   for (const pc of state.peers.values()) pc.close(); state.peers.clear(); state.remoteStreams.clear();
   document.querySelectorAll('[data-remote-audio],[data-remote-tile]').forEach(x => x.remove()); $('#enableRemoteAudio').classList.add('hidden'); $('#voiceConnectionStatus').textContent = 'Odaya katıldığında bağlantı durumu burada görünür.';
@@ -463,7 +473,7 @@ $('#volumeRange').value = localStorage.getItem('km_volume') || '75'; $('#localAu
 $('#themeToggle').onclick = $('#headerTheme').onclick = () => setTheme(document.body.classList.contains('light') ? 'dark' : 'light');
 $('#profileOpen').onclick = () => { if (!state.user) return; $('#profileName').textContent = state.user.username; $('#profileUsername').textContent = state.user.username; $('#profileEmail').textContent = state.user.email; $('#profileBio').value = state.user.bio || ''; $('#profileStatus').value = state.user.status || ''; $('#profileGenres').value = (state.user.genres || []).join(', '); $('#profileVisibility').value = state.user.profileVisibility || 'public'; $('#profileAvatar').textContent = initials(state.user.username); $('.profile-details > div:last-child b').textContent = state.user.isAdmin ? 'Yönetici' : 'Dinleyici'; activeView('profile'); loadProfileActivity(); };
 $('#profileTheme').onclick = () => setTheme(document.body.classList.contains('light') ? 'dark' : 'light'); $('#saveProfile').onclick = async () => { try { const data = await api('/api/me', { method: 'PATCH', body: JSON.stringify({ bio: $('#profileBio').value, status: $('#profileStatus').value, genres: $('#profileGenres').value.split(',').map(value => value.trim()).filter(Boolean), profileVisibility: $('#profileVisibility').value, theme: document.body.classList.contains('light') ? 'light' : 'dark' }) }); state.user = data.user; toast('Profil kaydedildi.'); } catch (e) { toast(e.message); } };
-$('#playlistCreateForm').onsubmit = async event => { event.preventDefault(); const form = event.currentTarget; try { const list = await api('/api/me/playlists', { method: 'POST', body: JSON.stringify({ name: form.elements.name.value }) }); state.playlists.unshift(list); form.reset(); renderPlaylists(); toast('Kişisel liste oluşturuldu.'); } catch (error) { toast(error.message); } };
+$('#playlistCreateForm').onsubmit = async event => { event.preventDefault(); const form = event.currentTarget; const name = form.elements.name.value.trim(); if (!name) return; try { await api('/api/me/playlists', { method: 'POST', body: JSON.stringify({ name }) }); const playlistRequest = ++state.playlistRequest; state.playlists = await api('/api/me/playlists'); if (playlistRequest === state.playlistRequest) renderPlaylists(); form.reset(); $('#profilePlaylists').scrollIntoView({ behavior: 'smooth', block: 'nearest' }); toast('Kişisel liste oluşturuldu.'); } catch (error) { toast(error.message); } };
 $('#savePlaylistBtn').onclick = async () => { if (!state.user) return modalAuth('login'); if (!state.queue.length) return toast('Kaydedilecek kuyruk boş.'); try { state.playlists = await api('/api/me/playlists'); const names = state.playlists.map((list, index) => `${index + 1}. ${list.name}`).join('\n'); const choice = prompt(`Kuyruğu hangi listeye ekleyelim?\n${names}\n\nListe numarasını yaz:`); if (!choice) return; const list = state.playlists[Number(choice) - 1]; if (!list) return toast('Geçerli bir liste numarası gir.'); const updated = await api(`/api/me/playlists/${encodeURIComponent(list._id || list.id)}`, { method: 'PATCH', body: JSON.stringify({ tracks: [...(list.tracks || []), ...state.queue] }) }); state.playlists = state.playlists.map(item => (item._id || item.id) === (list._id || list.id) ? updated : item); renderPlaylists(); toast('Kuyruk listeye eklendi.'); } catch (error) { toast(error.message); } };
 $('#announceBtn').onclick = () => { if (!state.isDj) return toast('Duyuruyu yalnızca oda sahibi veya DJ düzenleyebilir.'); const text = prompt('Oda duyurusu (boş bırakırsan kaldırılır):', state.room?.announcement || ''); if (text === null) return; state.socket.emit('room:announcement', text, result => { if (result?.error) toast(result.error); else toast(text.trim() ? 'Oda duyurusu yayımlandı.' : 'Duyuru kaldırıldı.'); }); };
 $('#notificationsOpen').onclick = async () => { await loadNotifications(); showModal('notificationsModal'); try { await api('/api/me/notifications/read', { method: 'POST' }); state.notifications = state.notifications.map(item => ({ ...item, read: true })); renderNotifications(); } catch {} };
@@ -499,4 +509,4 @@ function routeHash() {
 $$('.main-nav .nav-item').forEach(item => item.addEventListener('click', () => { if (location.hash === item.hash) routeHash(); }));
 window.addEventListener('hashchange', routeHash);
 const queryRoom = new URLSearchParams(location.search).get('room');
-bootstrap().then(() => { if (queryRoom && state.user) enterRoom(queryRoom); else if (queryRoom) { state.pendingRoom = queryRoom; modalAuth('login'); } else routeHash(); });
+bootstrap().then(() => { const roomToRestore = queryRoom || sessionStorage.getItem(ACTIVE_ROOM_KEY); if (roomToRestore && state.user) enterRoom(roomToRestore); else if (roomToRestore) { state.pendingRoom = roomToRestore; modalAuth('login'); } else routeHash(); });
