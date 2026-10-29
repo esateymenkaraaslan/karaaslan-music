@@ -297,9 +297,12 @@ app.get('/media/:id', async (req, res) => {
   mediaBucket.openDownloadStream(id).on('error', error => { if (!res.headersSent) res.status(404).end(); else res.destroy(error); }).pipe(res);
 });
 app.get('/api/catalog', async (_req, res) => res.json(await db.collection('tracks').find({}).sort({ createdAt: -1 }).limit(500).toArray()));
-app.get('/api/rooms', async (_req, res) => {
+async function getPublicRoomSnapshot() {
   const rooms = await db.collection('rooms').find({ $or: [{ visibility: 'public' }, { visibility: { $exists: false } }] }).sort({ createdAt: -1 }).limit(100).toArray();
-  res.json(rooms.map(r => ({ roomId: r.roomId, name: r.name, mood: r.mood, visibility: r.visibility || 'public', hostId: r.hostId, hostName: r.hostName || '', nowPlaying: r.playback?.track?.title || '', queueCount: (r.queue || []).length, participants: roomState.get(r.roomId)?.size || 0, createdAt: r.createdAt })));
+  return rooms.map(r => ({ roomId: r.roomId, name: r.name, mood: r.mood, visibility: r.visibility || 'public', hostId: r.hostId, hostName: r.hostName || '', nowPlaying: r.playback?.track?.title || '', queueCount: (r.queue || []).length, participants: roomState.get(r.roomId)?.size || 0, createdAt: r.createdAt }));
+}
+app.get('/api/rooms', async (_req, res) => {
+  res.json(await getPublicRoomSnapshot());
 });
 app.post('/api/rooms', auth, async (req, res) => {
   const roomId = crypto.randomBytes(8).toString('hex');
@@ -429,7 +432,11 @@ const roomListenStatsAt = new Map();
 let roomsUpdateTimer;
 function scheduleRoomsUpdate() {
   clearTimeout(roomsUpdateTimer);
-  roomsUpdateTimer = setTimeout(() => { roomsUpdateTimer = null; io.emit('rooms:update'); }, 180);
+  roomsUpdateTimer = setTimeout(async () => {
+    roomsUpdateTimer = null;
+    try { io.emit('rooms:update', await getPublicRoomSnapshot()); }
+    catch (error) { console.error('Room directory update failed:', error.message); }
+  }, 180);
 }
 function queueRoomJoin(roomId, work) {
   const previous = roomJoinQueues.get(roomId) || Promise.resolve();
@@ -646,21 +653,25 @@ io.on('connection', socket => {
       const secondsSinceStats = state.heartbeat ? Math.min(15, Math.max(0, Math.floor((Date.now() - (roomListenStatsAt.get(roomId) || Date.now())) / 1000))) : 0;
       if (state.heartbeat && secondsSinceStats >= 15) { roomListenStatsAt.set(roomId, Date.now()); if (playback.playing) roomUpdate.$inc = { ...(roomUpdate.$inc || {}), 'statistics.seconds': 15 }; }
       await db.collection('rooms').updateOne({ roomId }, roomUpdate);
+      io.to(roomId).emit('room:playback', playback);
       const activeUsers = [...new Set([...(roomState.get(roomId)?.values() || [])].map(person => person.userId))];
+      const backgroundWrites = [];
       if (trackChanged) {
         const recent = { title: track.title, artist: track.artist || '', source: track.source, videoId: track.videoId || '', url: track.url || '', roomId, playedAt: new Date() };
-        await db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.plays': 1 }, $push: { recentTracks: { $each: [recent], $position: 0, $slice: 30 } } } } })));
+        if (activeUsers.length) backgroundWrites.push(db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.plays': 1 }, $push: { recentTracks: { $each: [recent], $position: 0, $slice: 30 } } } } }))));
         const historyEntry = { trackId: track.id, title: track.title, artist: track.artist || '', source: track.source, videoId: track.videoId || '', url: track.url || '', playedBy: socket.user.username, playedAt: playback.updatedAt };
         io.to(roomId).emit('room:history', { roomId, entry: historyEntry });
-        for (const userId of activeUsers) for (const recipient of io.of('/').sockets.values()) if (recipient.user?.sub === userId) recipient.emit('user:history', { entry: recent });
+        const activeUserIds = new Set(activeUsers);
+        for (const recipient of io.of('/').sockets.values()) if (activeUserIds.has(recipient.user?.sub)) recipient.emit('user:history', { entry: recent });
       }
       if (secondsSinceStats >= 15 && playback.playing) {
-        await db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.seconds': 15 } } } })));
+        if (activeUsers.length) backgroundWrites.push(db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.seconds': 15 } } } }))));
         const activeUserIds = new Set(activeUsers);
         for (const recipient of io.of('/').sockets.values()) if (activeUserIds.has(recipient.user?.sub)) recipient.emit('user:stats', { roomId, seconds: 15 });
       }
       if (trackChanged || (secondsSinceStats >= 15 && playback.playing)) io.to(roomId).emit('room:stats', { roomId, statistics: { plays: (room.statistics?.plays || 0) + (trackChanged ? 1 : 0), seconds: (room.statistics?.seconds || 0) + (secondsSinceStats >= 15 && playback.playing ? 15 : 0) } });
-      io.to(roomId).emit('room:playback', playback); if (trackChanged) scheduleRoomsUpdate(); return { ok: true, revision: playback.revision };
+      if (backgroundWrites.length) Promise.all(backgroundWrites).catch(error => console.error('Listening statistics update failed:', error.message));
+      if (trackChanged) scheduleRoomsUpdate(); return { ok: true, revision: playback.revision };
     }).then(result => done(result || { ok: true })).catch(error => { console.error('Playback sync failed:', error.message); done({ error: 'Oynatma güncellenemedi. Tekrar dene.' }); });
   });
   onAsyncSocket(socket, 'room:dj:assign', async (userId, done = () => {}) => {
