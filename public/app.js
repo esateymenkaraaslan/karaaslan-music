@@ -231,10 +231,12 @@ function requirePlaybackGesture() {
   state.playbackNeedsGesture = true;
   $('#playBtn').textContent = '▶';
   renderPlaybackPermissions();
-  toast('Tarayıcı bu cihazda otomatik oynatmayı durdurdu. Dinlemeye devam etmek için oynat düğmesine dokun.');
+  $('#playbackGestureNotice')?.classList.remove('hidden');
+  toast('Tarayıcı bu cihazda otomatik oynatmayı durdurdu. Dinlemek için düğmeye dokun.');
 }
 function clearPlaybackGesture() {
   state.playbackNeedsGesture = false;
+  $('#playbackGestureNotice')?.classList.add('hidden');
   renderPlaybackPermissions();
 }
 async function loadTrackMedia(item, position = 0, shouldPlay = true) {
@@ -269,13 +271,9 @@ function applyPendingYoutube() {
 function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
 function syncPlayback(playing = true) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position: playerPosition(), index: state.selectedTrack, track: state.queue[state.selectedTrack], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); $('#playBtn').textContent = playing ? 'Ⅱ' : '▶'; }
 function togglePlayback() {
+  if (state.playbackNeedsGesture) return resumeLocalPlayback();
   if (!state.isDj) {
-    if (!state.playbackNeedsGesture) return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
-    const track = state.queue[state.selectedTrack]; if (!track) return;
-    const playback = state.lastPlayback || {}; const target = Math.max(0, Number(playback.position) || 0) + (playback.playing ? Math.max(0, (Date.now() - (playback.serverTime || Date.now())) / 1000) : 0);
-    if (track.source === 'youtube') { state.youtube?.seekTo(target, true); state.youtube?.playVideo(); clearPlaybackGesture(); }
-    else { const audio = $('#localAudio'); audio.currentTime = target; audio.play().then(clearPlaybackGesture).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); }); }
-    return;
+    return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
   }
   if (state.selectedTrack == null) return state.queue.length ? playAt(0) : toast('Önce kuyruğa bir şarkı ekle.');
   const track = state.queue[state.selectedTrack]; if (!track) { clearPlaybackSurface(); return toast('Bu odanın kuyruğu boş.'); }
@@ -285,6 +283,20 @@ function togglePlayback() {
   if (track.source === 'youtube') { if (playing) state.youtube?.playVideo?.(); else state.youtube?.pauseVideo?.(); }
   else if (playing) $('#localAudio').play().catch(() => {}); else $('#localAudio').pause();
   syncPlayback(playing);
+}
+function resumeLocalPlayback() {
+  const track = state.queue[state.selectedTrack]; if (!track) return;
+  const playback = state.lastPlayback || {};
+  const target = Math.max(0, Number(playback.position) || 0) + (playback.playing ? Math.max(0, (Date.now() - (playback.serverTime || Date.now())) / 1000) : 0);
+  if (track.source === 'youtube') {
+    if (state.pendingYoutube?.trackId === track.id && !state.ytPlayerReady) state.pendingYoutube.playing = true;
+    else if (state.youtube) { state.youtube.seekTo(target, true); state.youtube.playVideo(); }
+    else return toast('YouTube oynatıcı hazırlanıyor; birkaç saniye sonra tekrar dokun.');
+    clearPlaybackGesture(); $('#playBtn').textContent = 'Ⅱ';
+  } else {
+    const audio = $('#localAudio'); audio.currentTime = target;
+    audio.play().then(() => { clearPlaybackGesture(); $('#playBtn').textContent = 'Ⅱ'; }).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); });
+  }
 }
 function applyPlayback(playback, force = false) {
   if (!playback || (playback.roomId && playback.roomId !== state.room?.roomId)) return;
@@ -512,7 +524,9 @@ async function deleteRoom(roomId = state.room?.roomId) { if (!roomId || !confirm
 $('#roomMore').onclick = editCurrentRoom; $('#editRoom').onclick = editCurrentRoom; $('#deleteRoom').onclick = () => deleteRoom(); $('#inviteBtn').onclick = $('#roomInviteIcon').onclick = async () => { const url = `${location.origin}/?room=${state.room?.roomId || ''}`; try { await navigator.clipboard.writeText(url); toast('Davet bağlantısı kopyalandı.'); } catch { toast(`Oda kodu: ${state.room?.roomId}`); } }; $('#copyCode').onclick = () => navigator.clipboard.writeText(state.room?.roomId || '').then(() => toast('Oda kodu kopyalandı.')).catch(() => {});
 $$('.room-tab').forEach(tab => tab.onclick = () => selectTab(tab.dataset.tab));
 $('#chatPanel').insertAdjacentHTML('afterbegin', '<div id="activePoll" class="active-poll hidden"></div><div class="chat-tools"><span>Sohbet odadaki herkese görünür</span><button type="button" class="text-button" id="pollToggle">Anket oluştur</button></div><form id="pollComposer" class="poll-composer hidden"><input name="question" maxlength="120" required placeholder="Anket sorusu" /><div class="poll-choice-inputs"><input name="option" maxlength="50" required placeholder="Seçenek 1" /><input name="option" maxlength="50" required placeholder="Seçenek 2" /></div><input name="option" maxlength="50" placeholder="Seçenek 3 (isteğe bağlı)" /><button class="button button-outline" type="submit">Anketi paylaş</button></form>');
+$('#announcementBar').insertAdjacentHTML('afterend', '<div id="playbackGestureNotice" class="playback-gesture-notice hidden" role="status"><span>Bu tarayıcı otomatik oynatmayı engelledi. Ortak şarkı odada çalmaya devam ediyor; bu cihazda dinlemek için etkinleştir.</span><button type="button" class="button button-primary" id="resumeLocalPlayback">Bu cihazda dinle</button></div>');
 $('.voice-controls').insertAdjacentHTML('afterend', '<div class="personal-listen-controls"><button type="button" class="button button-outline" id="roomListenToggle"></button><label>Bu cihazdaki oda müziği <input id="listenVolume" type="range" min="0" max="100" value="75" aria-label="Bu cihazdaki oda müziği ses düzeyi" /></label><small>Müzik sessizdeyken oda diğer kişilerde çalmaya devam eder.</small></div>');
+$('#resumeLocalPlayback').onclick = resumeLocalPlayback;
 $('#pollToggle').onclick = () => { if (!state.room) return; $('#pollComposer').classList.toggle('hidden'); $('#pollComposer').elements.question.focus(); };
 $('#pollComposer').onsubmit = e => { e.preventDefault(); const form = e.currentTarget; const options = [...form.querySelectorAll('[name="option"]')].map(input => input.value.trim()).filter(Boolean); state.socket.emit('room:poll:create', { question: form.elements.question.value, options }, result => { if (result?.error) toast(result.error); else { form.reset(); form.classList.add('hidden'); toast('Anket odada paylaşıldı.'); } }); };
 $('#chatForm').onsubmit = e => { e.preventDefault(); const text = $('#chatInput').value.trim(); if (text) { state.socket.emit('room:chat', { text }, result => { if (result?.error) toast(result.error); }); $('#chatInput').value = ''; } };

@@ -186,3 +186,6 @@ body.light{background:radial-gradient(ellipse at 76% 2%,#c2943a14,transparent 30
   .main-nav .nav-icon{font-size:18px}
   .main-content{padding-bottom:22px}
 }
+.playback-gesture-notice{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:10px 0 14px;padding:12px 14px;border:1px solid #d9a64c66;border-radius:10px;background:linear-gradient(110deg,#d9a64c1c,#17130d);color:var(--text);font-size:13px;line-height:1.45}
+.playback-gesture-notice .button{flex:none}
+@media(max-width:570px){.playback-gesture-notice{align-items:stretch;flex-direction:column;gap:10px;font-size:12px}.playback-gesture-notice .button{width:100%}}
