@@ -83,11 +83,20 @@ async function migrateLegacyMedia() {
   }
   if (moved.size) console.log(`Migrated ${moved.size} legacy upload(s) into MongoDB GridFS.`);
 }
-async function notifyUser(userId, type, title, message, roomId = '') {
+async function notifyUser(userId, type, title, message, roomId = '', metadata = {}) {
   if (!userId) return;
-  const notification = { userId: String(userId), type, title: String(title).slice(0, 80), message: String(message).slice(0, 180), roomId, read: false, createdAt: new Date() };
+  const notification = { userId: String(userId), type, title: String(title).slice(0, 80), message: String(message).slice(0, 180), roomId, metadata, read: false, createdAt: new Date() };
   const result = await db.collection('notifications').insertOne(notification); notification.id = result.insertedId.toString();
   for (const socket of io.of('/').sockets.values()) if (socket.user?.sub === String(userId)) socket.emit('notification:new', notification);
+}
+function directRoomId(first, second) { return `dm:${[String(first), String(second)].sort().join(':')}`; }
+async function areFriends(firstId, secondId) {
+  if (!ObjectId.isValid(firstId) || !ObjectId.isValid(secondId) || firstId === secondId) return false;
+  const [first, second] = await Promise.all([
+    db.collection('users').findOne({ _id: new ObjectId(firstId) }, { projection: { friends: 1 } }),
+    db.collection('users').findOne({ _id: new ObjectId(secondId) }, { projection: { friends: 1 } })
+  ]);
+  return (first?.friends || []).includes(secondId) && (second?.friends || []).includes(firstId);
 }
 
 app.post('/api/auth/register', async (req, res) => {
@@ -178,8 +187,8 @@ app.post('/api/me/friends/request', auth, async (req, res) => {
   }
   const existing = await db.collection('friendRequests').findOne({ from, to, status: 'pending' });
   if (existing) return res.json({ ok: true, pending: true });
-  await db.collection('friendRequests').insertOne({ from, to, status: 'pending', createdAt: new Date() });
-  await notifyUser(to, 'friend-request', 'Yeni arkadaşlık isteği', `${req.user.username} seninle arkadaş olmak istiyor.`);
+  const requestResult = await db.collection('friendRequests').insertOne({ from, to, status: 'pending', createdAt: new Date() });
+  await notifyUser(to, 'friend-request', 'Yeni arkadaşlık isteği', `${req.user.username} seninle arkadaş olmak istiyor.`, '', { friendRequestId: requestResult.insertedId.toString() });
   res.status(201).json({ ok: true, pending: true });
 });
 app.post('/api/me/friends/requests/:id', auth, async (req, res) => {
@@ -197,6 +206,35 @@ app.delete('/api/me/friends/:id', auth, async (req, res) => {
   if (!ObjectId.isValid(req.params.id) || req.params.id === req.user.sub) return res.status(400).json({ error: 'Arkadaş kimliği geçersiz.' });
   await Promise.all([db.collection('users').updateOne({ _id: new ObjectId(req.user.sub) }, { $pull: { friends: req.params.id } }), db.collection('users').updateOne({ _id: new ObjectId(req.params.id) }, { $pull: { friends: req.user.sub } })]);
   res.json({ ok: true });
+});
+app.get('/api/community/members', auth, async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 40);
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const page = Math.max(0, Math.min(10000, Number.parseInt(req.query.page, 10) || 0)); const pageSize = 50;
+  const memberFilter = { _id: { $ne: new ObjectId(req.user.sub) }, ...(q ? { username: { $regex: escaped, $options: 'i' } } : {}) };
+  const [me, requests] = await Promise.all([
+    db.collection('users').findOne({ _id: new ObjectId(req.user.sub) }, { projection: { friends: 1 } }),
+    db.collection('friendRequests').find({ $or: [{ from: req.user.sub }, { to: req.user.sub }], status: 'pending' }, { projection: { from: 1, to: 1 } }).toArray()
+  ]);
+  const [people, total] = await Promise.all([
+    db.collection('users').find(memberFilter, { projection: { username: 1, avatar: 1, status: 1, profileVisibility: 1 } }).sort({ username: 1 }).skip(page * pageSize).limit(pageSize).toArray(),
+    db.collection('users').countDocuments(memberFilter)
+  ]);
+  const online = new Set([...io.of('/').sockets.values()].map(socket => socket.user?.sub)); const friends = new Set(me?.friends || []);
+  res.json({ members: people.map(person => {
+    const id = person._id.toString();
+    const request = requests.find(item => item.from === req.user.sub && item.to === id || item.from === id && item.to === req.user.sub);
+    return { id, username: person.username, avatar: person.avatar || '', status: person.status || '', online: online.has(id), isFriend: friends.has(id), requestSent: request?.from === req.user.sub, requestReceived: request?.to === req.user.sub, requestId: request?._id?.toString() || '' };
+  }), total, page, pages: Math.ceil(total / pageSize) });
+});
+app.get('/api/me/dms/:friendId', auth, async (req, res) => {
+  const friendId = String(req.params.friendId || '');
+  if (!(await areFriends(req.user.sub, friendId))) return res.status(403).json({ error: 'Özel mesajlar yalnızca arkadaşlar arasında kullanılabilir.' });
+  const messages = await db.collection('directMessages').find({ $or: [{ fromId: req.user.sub, toId: friendId }, { fromId: friendId, toId: req.user.sub }] }).sort({ createdAt: -1 }).limit(100).toArray();
+  const senderIds = [...new Set(messages.map(item => item.fromId))].filter(ObjectId.isValid).map(value => new ObjectId(value));
+  const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { username: 1 } }).toArray() : [];
+  const usernames = new Map(senders.map(person => [person._id.toString(), person.username]));
+  res.json(messages.reverse().map(item => ({ id: item._id.toString(), fromId: item.fromId, fromUsername: usernames.get(item.fromId) || '', text: item.text, createdAt: item.createdAt })));
 });
 app.post('/api/rooms/:roomId/invite-friend', auth, async (req, res) => {
   const roomId = String(req.params.roomId || '').slice(0, 40); const friendId = String(req.body.friendId || '');
@@ -443,6 +481,50 @@ io.use(async (socket, next) => {
   catch { next(new Error('Oturum açmanız gerekiyor.')); }
 });
 io.on('connection', socket => {
+  io.emit('community:presence');
+  onAsyncSocket(socket, 'community:chat:join', async (_payload, done = () => {}) => {
+    socket.join('community:chat');
+    const messages = await db.collection('communityMessages').find({}).sort({ createdAt: -1 }).limit(100).toArray();
+    done({ messages: messages.reverse().map(item => ({ id: item._id.toString(), username: item.username, text: item.text, createdAt: item.createdAt })) });
+  });
+  onAsyncSocket(socket, 'community:chat:send', async ({ text } = {}, done = () => {}) => {
+    const message = String(text || '').trim().slice(0, 500);
+    if (!message) return done({ error: 'Mesaj boş olamaz.' });
+    if (!allowSocketEvent(socket, 'community-chat', 8, 5_000)) return done({ error: 'Sohbete çok hızlı mesaj gönderiyorsun. Biraz bekle.' });
+    const item = { username: socket.user.username, userId: socket.user.sub, text: message, createdAt: new Date() };
+    const result = await db.collection('communityMessages').insertOne(item);
+    const visible = { id: result.insertedId.toString(), username: item.username, text: item.text, createdAt: item.createdAt };
+    io.to('community:chat').emit('community:chat:message', visible); done({ ok: true });
+  });
+  onAsyncSocket(socket, 'dm:join', async ({ friendId } = {}, done = () => {}) => {
+    friendId = String(friendId || '');
+    if (!(await areFriends(socket.user.sub, friendId))) return done({ error: 'Özel sohbet yalnızca arkadaşlar arasında kullanılabilir.' });
+    const roomId = directRoomId(socket.user.sub, friendId); socket.data.dmRooms ||= new Set(); socket.data.dmRooms.add(roomId); socket.join(roomId);
+    const raw = await db.collection('directMessages').find({ $or: [{ fromId: socket.user.sub, toId: friendId }, { fromId: friendId, toId: socket.user.sub }] }).sort({ createdAt: -1 }).limit(100).toArray();
+    const senderIds = [...new Set(raw.map(item => item.fromId))].filter(ObjectId.isValid).map(value => new ObjectId(value));
+    const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { username: 1 } }).toArray() : [];
+    const usernames = new Map(senders.map(person => [person._id.toString(), person.username]));
+    done({ messages: raw.reverse().map(item => ({ id: item._id.toString(), fromId: item.fromId, fromUsername: usernames.get(item.fromId) || '', text: item.text, createdAt: item.createdAt })) });
+  });
+  onAsyncSocket(socket, 'dm:leave', async ({ friendId } = {}) => {
+    const roomId = directRoomId(socket.user.sub, String(friendId || ''));
+    socket.leave(roomId); socket.data.dmRooms?.delete(roomId);
+  });
+  onAsyncSocket(socket, 'dm:send', async ({ friendId, text } = {}, done = () => {}) => {
+    friendId = String(friendId || ''); const message = String(text || '').trim().slice(0, 500);
+    if (!message) return done({ error: 'Mesaj boş olamaz.' });
+    if (!allowSocketEvent(socket, 'direct-message', 12, 5_000)) return done({ error: 'Çok hızlı mesaj gönderiyorsun. Biraz bekle.' });
+    if (!(await areFriends(socket.user.sub, friendId))) return done({ error: 'Özel mesaj yalnızca arkadaşlar arasında kullanılabilir.' });
+    const item = { fromId: socket.user.sub, toId: friendId, fromUsername: socket.user.username, text: message, createdAt: new Date() };
+    const result = await db.collection('directMessages').insertOne(item);
+    const visible = { id: result.insertedId.toString(), fromId: item.fromId, fromUsername: item.fromUsername, text: item.text, createdAt: item.createdAt };
+    for (const socketId of io.sockets.adapter.rooms.get(directRoomId(item.fromId, friendId)) || []) {
+      const recipient = io.sockets.sockets.get(socketId);
+      recipient?.emit('dm:message', { friendId: recipient.user?.sub === item.fromId ? friendId : item.fromId, message: visible });
+    }
+    await notifyUser(friendId, 'direct-message', `Yeni mesaj · ${item.fromUsername}`, message, '', { userId: item.fromId });
+    done({ ok: true });
+  });
   onAsyncSocket(socket, 'room:join', async ({ roomId, username } = {}, done = () => {}) => {
     if (socket.data.roomId && socket.data.roomId !== roomId) { try { await leaveCurrentRoom(socket); } catch (error) { console.error('Room switch cleanup failed:', error.message); return done({ error: 'Önceki odadan ayrılırken bağlantı hatası oluştu.' }); } }
     roomId = String(roomId || '').trim().slice(0, 40);
@@ -675,7 +757,7 @@ io.on('connection', socket => {
   });
   socket.on('rtc:signal', ({ to, signal } = {}) => { const target = typeof to === 'string' ? io.sockets.sockets.get(to) : null; if (socket.data.roomId && target?.data.roomId === socket.data.roomId && signal && JSON.stringify(signal).length < 100000) target.emit('rtc:signal', { from: socket.id, signal }); });
   socket.on('room:leave', () => { leaveCurrentRoom(socket).catch(error => console.error('Room leave failed:', error.message)); });
-  socket.on('disconnect', () => { leaveCurrentRoom(socket).catch(error => console.error('Room disconnect cleanup failed:', error.message)); });
+  socket.on('disconnect', () => { leaveCurrentRoom(socket).catch(error => console.error('Room disconnect cleanup failed:', error.message)).finally(() => io.emit('community:presence')); });
 });
 
 async function leaveCurrentRoom(socket) {
@@ -710,6 +792,9 @@ async function start() {
   await db.collection('rooms').createIndex({ roomId: 1 }, { unique: true });
   await db.collection('friendRequests').createIndex({ to: 1, status: 1, createdAt: -1 });
   await db.collection('friendRequests').createIndex({ from: 1, to: 1, status: 1 });
+  await db.collection('communityMessages').createIndex({ createdAt: -1 });
+  await db.collection('directMessages').createIndex({ fromId: 1, toId: 1, createdAt: -1 });
+  await db.collection('directMessages').createIndex({ toId: 1, fromId: 1, createdAt: -1 });
   await migrateLegacyMedia();
   let bootstrapAdmin = await db.collection('users').findOne({ bootstrapAdmin: true });
   if (!bootstrapAdmin && process.env.ADMIN_USERNAME && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD !== 'change-this-before-first-run') {

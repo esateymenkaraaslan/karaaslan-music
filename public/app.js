@@ -3,7 +3,7 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const savedToken = localStorage.getItem('km_token') || sessionStorage.getItem('km_token') || '';
 if (savedToken && !localStorage.getItem('km_token') && sessionStorage.getItem('km_remember') !== '0') localStorage.setItem('km_token', savedToken);
 const ACTIVE_ROOM_KEY = 'km_active_room';
-const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], friends: { friends: [], incoming: [], outgoing: [] }, chatMessages: [], playlistRequest: 0, roomRefreshRequest: 0, room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, localMusicMuted: localStorage.getItem('km_music_muted') === '1', toastTimer: null };
+const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], friends: { friends: [], incoming: [], outgoing: [] }, communityMembers: [], communityTotal: 0, communityPage: 0, communityPages: 1, communityMessages: [], dmMessages: [], activeDmFriend: null, communityTab: 'members', chatMessages: [], playlistRequest: 0, roomRefreshRequest: 0, room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, localMusicMuted: localStorage.getItem('km_music_muted') === '1', toastTimer: null };
 const api = async (url, options = {}) => {
   const headers = { ...(options.body && !(options.body instanceof Blob) && !(options.body instanceof ArrayBuffer) ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
@@ -70,7 +70,10 @@ function connectSocket() {
       if (state.source === 'library' && $('#trackSearch').value.trim()) searchTracks();
       if (state.user?.isAdmin && !$('#adminCatalogPane').classList.contains('hidden')) loadAdminTracks();
     });
-    state.socket.on('notification:new', notification => { if (!notification?.id || !state.notifications.some(item => item.id === notification.id)) state.notifications.unshift(notification); renderNotifications(); if (notification?.type?.startsWith('friend-') && !$('#profileView').classList.contains('hidden')) loadFriends(); toast(notification.title); });
+    state.socket.on('notification:new', notification => { if (!notification?.id || !state.notifications.some(item => item.id === notification.id)) state.notifications.unshift(notification); renderNotifications(); if (notification?.type?.startsWith('friend-')) { if (!$('#profileView').classList.contains('hidden')) loadFriends(); if (!$('#communityView').classList.contains('hidden')) { loadFriends(); loadCommunityMembers(); } } toast(notification.title); });
+    state.socket.on('community:presence', () => { if (!$('#communityView').classList.contains('hidden')) scheduleCommunityMembers(); });
+    state.socket.on('community:chat:message', message => appendCommunityMessage(message));
+    state.socket.on('dm:message', event => { if (event?.friendId !== state.activeDmFriend?.id) return; appendDirectMessage(event.message); });
     state.socket.on('user:history', scheduleProfileActivityRefresh);
     state.socket.on('user:stats', scheduleProfileActivityRefresh);
     state.socket.on('room:session:replaced', event => {
@@ -84,6 +87,8 @@ function connectSocket() {
         loadNotifications();
         if (state.room) enterRoom(state.room.roomId, { forceRejoin: true });
         if (!$('#profileView').classList.contains('hidden')) scheduleProfileActivityRefresh();
+        if (state.communityTab === 'general' && !$('#communityView').classList.contains('hidden')) joinCommunityChat();
+        if (state.activeDmFriend && !$('#communityView').classList.contains('hidden')) joinDirectChat(state.activeDmFriend);
       }
       state.socketConnectedBefore = true;
     });
@@ -102,7 +107,7 @@ function renderRoomDirectory() {
   $$('[data-directory-join]').forEach(button => button.addEventListener('click', () => enterRoom(button.dataset.directoryJoin)));
   $$('[data-favorite-room]').forEach(button => button.addEventListener('click', async () => { if (!state.user) return modalAuth('login'); try { const favorite = !button.classList.contains('active'); await api(`/api/me/favorites/rooms/${encodeURIComponent(button.dataset.favoriteRoom)}`, { method: 'PUT', body: JSON.stringify({ favorite }) }); state.user.favoriteRooms = state.user.favoriteRooms || []; state.user.favoriteRooms = favorite ? [...new Set([...state.user.favoriteRooms, button.dataset.favoriteRoom])] : state.user.favoriteRooms.filter(id => id !== button.dataset.favoriteRoom); await refreshRooms(); } catch (error) { toast(error.message); } }));
 }
-function activeView(name) { $('#homeView').classList.toggle('hidden', name !== 'home'); $('#roomsDirectoryView').classList.toggle('hidden', name !== 'rooms'); $('#roomView').classList.toggle('hidden', name !== 'room'); $('#profileView').classList.toggle('hidden', name !== 'profile'); $('#pageCrumb').textContent = name === 'room' ? 'Dinleme odası' : name === 'rooms' ? 'Dinleme odaları' : name === 'profile' ? 'Profilim' : 'Senin için'; $$('.main-nav .nav-item').forEach(item => item.classList.toggle('active', item.hash === (name === 'profile' ? '#profile' : name === 'rooms' || name === 'room' ? '#room' : '#home'))); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+function activeView(name) { $('#homeView').classList.toggle('hidden', name !== 'home'); $('#roomsDirectoryView').classList.toggle('hidden', name !== 'rooms'); $('#roomView').classList.toggle('hidden', name !== 'room'); $('#profileView').classList.toggle('hidden', name !== 'profile'); $('#communityView').classList.toggle('hidden', name !== 'community'); $('#pageCrumb').textContent = name === 'room' ? 'Dinleme odası' : name === 'rooms' ? 'Dinleme odaları' : name === 'profile' ? 'Profilim' : name === 'community' ? 'Topluluk' : 'Senin için'; $$('.main-nav .nav-item').forEach(item => item.classList.toggle('active', item.hash === (name === 'profile' ? '#profile' : name === 'community' ? '#community' : name === 'rooms' || name === 'room' ? '#room' : '#home'))); window.scrollTo({ top: 0, behavior: 'smooth' }); }
 function enterRoom(roomId, { forceRejoin = false } = {}) {
   if (!requireUser()) return;
   roomId = String(roomId || '').trim();
@@ -147,9 +152,10 @@ function renderParticipants() {
   state.participants = uniqueParticipants(state.participants);
   const ownerId = $('#participantList').dataset.owner;
   $('#participantCount').textContent = `${state.participants.length} kişi`;
-  $('#participantList').innerHTML = state.participants.map(p => `<div class="participant" data-person="${escapeHtml(p.id)}"><span class="participant-avatar">${p.avatar ? `<img src="${escapeHtml(p.avatar)}" alt="" />` : escapeHtml(initials(p.username))}</span><span>${p.userId === state.user?.id ? `${escapeHtml(p.username)} (sen)` : `<button class="participant-profile-link" data-profile-view="${escapeHtml(p.username)}">${escapeHtml(p.username)}</button>`}</span>${p.micOn ? '<span class="media-indicator">MIC</span>' : ''}${p.cameraOn ? '<span class="media-indicator">CAM</span>' : ''}${p.userId === ownerId ? '<span class="participant-role">SAHİP</span>' : p.isDj ? '<span class="participant-role">DJ</span>' : ''}${p.userId !== state.user?.id && (state.isHost || state.user?.isAdmin || state.isDj) ? `<button class="participant-more" data-person-menu="${escapeHtml(p.userId)}" title="Üye işlemleri">···</button>` : ''}</div>`).join('') || '<div class="side-empty">Katılımcılar yükleniyor.</div>';
-  $$('[data-person-menu]').forEach(button => button.addEventListener('click', e => { e.stopPropagation(); document.querySelectorAll('.participant-menu').forEach(menu => menu.remove()); const person = state.participants.find(p => p.userId === button.dataset.personMenu); if (!person) return; const menu = document.createElement('div'); menu.className = 'participant-menu'; menu.innerHTML = `${(state.isHost || state.user?.isAdmin) ? (person.isDj ? '<button data-action="revoke">DJ yetkisini kaldır</button>' : '<button data-action="dj">DJ yap</button>') : ''}${state.isDj ? '<button data-action="handoff">DJ kontrolünü devret</button>' : ''}${state.isHost ? '<button data-action="host">Oda sahipliğini devret</button>' : ''}${(state.isHost || state.user?.isAdmin) ? '<button data-action="kick" class="danger-action">Üyeyi odadan çıkar</button>' : ''}`; button.parentElement.append(menu); menu.onclick = event => { const action = event.target.closest('[data-action]')?.dataset.action; if (!action) return; if (action === 'kick') { if (!confirm(`${person.username} odadan çıkarılsın mı?`)) return; state.socket.emit('room:kick', person.userId); } if (action === 'dj' || action === 'revoke') { const eventName = action === 'dj' ? 'room:dj:assign' : 'room:dj:revoke'; state.socket.emit(eventName, person.userId, result => { if (result?.error) toast(result.error); else toast(action === 'dj' ? `${person.username} DJ oldu.` : `${person.username} için DJ rolü kaldırıldı.`); }); } if (action === 'handoff') state.socket.emit('room:dj:handoff', person.userId, result => { if (result?.error) toast(result.error); else toast(`DJ kontrolü ${person.username} kullanıcısına devredildi.`); }); if (action === 'host') { if (!confirm(`Oda sahipliği ${person.username} kullanıcısına devredilsin mi?`)) return; state.socket.emit('room:host:transfer', person.userId); } menu.remove(); }; document.addEventListener('click', () => menu.remove(), { once: true }); }));
+  $('#participantList').innerHTML = state.participants.map(p => `<div class="participant" data-person="${escapeHtml(p.id)}"><span class="participant-avatar">${p.avatar ? `<img src="${escapeHtml(p.avatar)}" alt="" />` : escapeHtml(initials(p.username))}</span><span>${p.userId === state.user?.id ? `${escapeHtml(p.username)} (sen)` : `<button class="participant-profile-link" data-profile-view="${escapeHtml(p.username)}">${escapeHtml(p.username)}</button>`}</span>${p.micOn ? '<span class="media-indicator">MIC</span>' : ''}${p.cameraOn ? '<span class="media-indicator">CAM</span>' : ''}${p.userId === ownerId ? '<span class="participant-role">SAHİP</span>' : p.isDj ? '<span class="participant-role">DJ</span>' : ''}${p.userId !== state.user?.id ? `<button class="participant-more" data-person-menu="${escapeHtml(p.userId)}" title="Üye işlemleri">···</button>` : ''}</div>`).join('') || '<div class="side-empty">Katılımcılar yükleniyor.</div>';
+  $$('[data-person-menu]').forEach(button => button.addEventListener('click', e => { e.stopPropagation(); document.querySelectorAll('.participant-menu').forEach(menu => menu.remove()); const person = state.participants.find(p => p.userId === button.dataset.personMenu); if (!person) return; const menu = document.createElement('div'); menu.className = 'participant-menu'; menu.innerHTML = `<button data-action="friend-request">Arkadaşlık isteği gönder</button>${(state.isHost || state.user?.isAdmin) ? (person.isDj ? '<button data-action="revoke">DJ yetkisini kaldır</button>' : '<button data-action="dj">DJ yap</button>') : ''}${state.isDj ? '<button data-action="handoff">DJ kontrolünü devret</button>' : ''}${state.isHost ? '<button data-action="host">Oda sahipliğini devret</button>' : ''}${(state.isHost || state.user?.isAdmin) ? '<button data-action="kick" class="danger-action">Üyeyi odadan çıkar</button>' : ''}`; button.parentElement.append(menu); menu.onclick = event => { const action = event.target.closest('[data-action]')?.dataset.action; if (!action) return; if (action === 'friend-request') api('/api/me/friends/request', { method: 'POST', body: JSON.stringify({ username: person.username }) }).then(() => { toast('Arkadaşlık isteği gönderildi.'); if (!$('#communityView').classList.contains('hidden')) loadCommunityMembers(); }).catch(error => toast(error.message)); if (action === 'kick') { if (!confirm(`${person.username} odadan çıkarılsın mı?`)) return; state.socket.emit('room:kick', person.userId); } if (action === 'dj' || action === 'revoke') { const eventName = action === 'dj' ? 'room:dj:assign' : 'room:dj:revoke'; state.socket.emit(eventName, person.userId, result => { if (result?.error) toast(result.error); else toast(action === 'dj' ? `${person.username} DJ oldu.` : `${person.username} için DJ rolü kaldırıldı.`); }); } if (action === 'handoff') state.socket.emit('room:dj:handoff', person.userId, result => { if (result?.error) toast(result.error); else toast(`DJ kontrolü ${person.username} kullanıcısına devredildi.`); }); if (action === 'host') { if (!confirm(`Oda sahipliği ${person.username} kullanıcısına devredilsin mi?`)) return; state.socket.emit('room:host:transfer', person.userId); } menu.remove(); }; document.addEventListener('click', () => menu.remove(), { once: true }); }));
   $('[data-profile-view]').forEach(button => button.onclick = () => openPublicProfile(button.dataset.profileView));
+  $$('.participant').forEach(row => row.oncontextmenu = event => { const button = row.querySelector('[data-person-menu]'); if (!button) return; event.preventDefault(); button.click(); });
   $('#voiceParticipants').innerHTML = state.participants.map(p => `<span class="voice-person">${escapeHtml(p.username)}${p.micOn ? ' · MIC' : ''}${p.cameraOn ? ' · CAM' : ''}</span>`).join('');
 }
 async function openPublicProfile(username) {
@@ -355,6 +361,82 @@ async function loadFriends() {
     $$('[data-invite-friend]').forEach(button => button.onclick = async () => { try { await api(`/api/rooms/${encodeURIComponent(state.room.roomId)}/invite-friend`, { method: 'POST', body: JSON.stringify({ friendId: button.dataset.inviteFriend }) }); toast('Oda daveti gönderildi.'); } catch (error) { toast(error.message); } });
   } catch (error) { $('#friendRequests').textContent = error.message; }
 }
+let communityMemberTimer;
+function scheduleCommunityMembers() { clearTimeout(communityMemberTimer); communityMemberTimer = setTimeout(() => loadCommunityMembers(), 250); }
+async function loadCommunityMembers() {
+  if (!state.user) return;
+  try {
+    const result = await api(`/api/community/members?q=${encodeURIComponent($('#communitySearch').value.trim())}&page=${state.communityPage}`);
+    state.communityMembers = result.members || []; state.communityTotal = result.total || 0; state.communityPages = Math.max(1, result.pages || 1);
+    if (state.communityPage >= state.communityPages) { state.communityPage = state.communityPages - 1; return loadCommunityMembers(); }
+    $('#memberCount').textContent = state.communityTotal;
+    $('#communityMembers').innerHTML = state.communityMembers.length ? state.communityMembers.map(person => {
+      const avatar = person.avatar ? `<img src="${escapeHtml(person.avatar)}" alt="" />` : escapeHtml(initials(person.username));
+      const status = person.online ? 'Çevrimiçi' : person.status || 'Karaaslan Müzik üyesi';
+      let action = person.isFriend ? `<button class="button button-outline" data-community-dm="${escapeHtml(person.id)}">Mesaj gönder</button>` : person.requestReceived ? `<button class="button button-primary" data-community-accept="${escapeHtml(person.requestId)}">İsteği kabul et</button>` : person.requestSent ? '<button class="button button-outline" disabled>İstek gönderildi</button>' : `<button class="button button-outline" data-community-request="${escapeHtml(person.username)}">Arkadaş ekle</button>`;
+      return `<article class="community-member"><span class="community-avatar">${avatar}</span><div class="community-member-copy"><b>${escapeHtml(person.username)}</b><span>${escapeHtml(status)}</span></div>${action}</article>`;
+    }).join('') : '<p class="activity-empty">Bu aramayla eşleşen üye bulunamadı.</p>';
+    $$('[data-community-request]').forEach(button => button.onclick = async () => { try { await api('/api/me/friends/request', { method: 'POST', body: JSON.stringify({ username: button.dataset.communityRequest }) }); toast('Arkadaşlık isteği gönderildi; karşı tarafa bildirim gitti.'); await loadCommunityMembers(); } catch (error) { toast(error.message); } });
+    $$('[data-community-accept]').forEach(button => button.onclick = async () => { try { await api(`/api/me/friends/requests/${encodeURIComponent(button.dataset.communityAccept)}`, { method: 'POST', body: JSON.stringify({ accept: true }) }); toast('Arkadaşlık isteği kabul edildi.'); await loadCommunityMembers(); await loadFriends(); } catch (error) { toast(error.message); } });
+    $$('[data-community-dm]').forEach(button => button.onclick = async () => { await openDirectChat(state.friends.friends.find(person => person.id === button.dataset.communityDm) || { id: button.dataset.communityDm, username: button.closest('.community-member').querySelector('.community-member-copy b').textContent }); selectCommunityTab('dms'); });
+    const pagination = $('#communityPagination');
+    pagination.innerHTML = state.communityPages > 1 ? `<button type="button" class="button button-outline" data-community-page="prev" ${state.communityPage <= 0 ? 'disabled' : ''}>Önceki</button><span>${state.communityPage + 1} / ${state.communityPages} · ${state.communityTotal} üye</span><button type="button" class="button button-outline" data-community-page="next" ${state.communityPage + 1 >= state.communityPages ? 'disabled' : ''}>Sonraki</button>` : `<span>${state.communityTotal} üye</span>`;
+    $$('[data-community-page]').forEach(button => button.onclick = () => { state.communityPage += button.dataset.communityPage === 'next' ? 1 : -1; loadCommunityMembers(); });
+  } catch (error) { $('#communityMembers').textContent = error.message; }
+}
+function selectCommunityTab(tab) {
+  state.communityTab = tab;
+  $$('.community-tab').forEach(button => button.classList.toggle('active', button.dataset.communityTab === tab));
+  ['members', 'general', 'dms'].forEach(name => $(`#community${name[0].toUpperCase()}${name.slice(1)}Pane`).classList.toggle('hidden', name !== tab));
+  if (tab === 'members') loadCommunityMembers();
+  if (tab === 'general') joinCommunityChat();
+  if (tab === 'dms') loadDirectFriends();
+}
+function joinCommunityChat() {
+  if (!state.socket?.connected) return;
+  state.socket.emit('community:chat:join', {}, result => { if (result?.error) return toast(result.error); state.communityMessages = result.messages || []; renderCommunityMessages(); });
+}
+function appendCommunityMessage(message) {
+  if (!message?.id || state.communityMessages.some(item => item.id === message.id)) return;
+  state.communityMessages.push(message); state.communityMessages = state.communityMessages.slice(-100); renderCommunityMessages();
+}
+function renderCommunityMessages() {
+  const box = $('#communityMessages'); if (!box) return;
+  box.innerHTML = state.communityMessages.length ? state.communityMessages.map(message => `<article class="community-message"><span class="community-avatar">${escapeHtml(initials(message.username))}</span><div><b>${escapeHtml(message.username)}</b><p>${escapeHtml(message.text)}</p><time>${new Date(message.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</time></div></article>`).join('') : '<div class="chat-welcome">Genel sohbette henüz mesaj yok. İlk mesajı sen yaz.</div>';
+  box.scrollTop = box.scrollHeight;
+}
+async function loadDirectFriends() {
+  if (!state.user) return;
+  try { state.friends = await api('/api/me/friends');
+    $('#dmFriendList').innerHTML = state.friends.friends.length ? state.friends.friends.map(person => `<button type="button" class="dm-friend ${state.activeDmFriend?.id === person.id ? 'active' : ''}" data-dm-friend="${escapeHtml(person.id)}"><span class="community-avatar">${person.avatar ? `<img src="${escapeHtml(person.avatar)}" alt="" />` : escapeHtml(initials(person.username))}</span><span><b>${escapeHtml(person.username)}</b><small>${person.online ? 'Çevrimiçi' : 'Mesajlaşma'}</small></span></button>`).join('') : '<p class="activity-empty">Özel sohbet için önce arkadaş ekle.</p>';
+    $$('[data-dm-friend]').forEach(button => button.onclick = () => openDirectChat(state.friends.friends.find(person => person.id === button.dataset.dmFriend)));
+  } catch (error) { $('#dmFriendList').textContent = error.message; }
+}
+async function openDirectChat(friend) {
+  if (!friend?.id) return;
+  if (state.activeDmFriend && state.activeDmFriend.id !== friend.id) state.socket?.emit('dm:leave', { friendId: state.activeDmFriend.id });
+  state.activeDmFriend = friend; state.dmMessages = []; $('#dmTitle').textContent = `@${friend.username}`; $('#dmChatForm').classList.remove('hidden'); renderDirectFriends(); renderDirectMessages();
+  if (!state.socket?.connected) return toast('Canlı bağlantı kuruluyor; birazdan mesajlarını yenile.');
+  state.socket.emit('dm:join', { friendId: friend.id }, result => {
+    if (state.activeDmFriend?.id !== friend.id) return;
+    if (result?.error) { toast(result.error); return; }
+    state.dmMessages = result.messages || []; renderDirectMessages();
+  });
+}
+function renderDirectFriends() {
+  const list = $('#dmFriendList'); if (!list || !state.friends.friends.length) return;
+  list.innerHTML = state.friends.friends.map(person => `<button type="button" class="dm-friend ${state.activeDmFriend?.id === person.id ? 'active' : ''}" data-dm-friend="${escapeHtml(person.id)}"><span class="community-avatar">${person.avatar ? `<img src="${escapeHtml(person.avatar)}" alt="" />` : escapeHtml(initials(person.username))}</span><span><b>${escapeHtml(person.username)}</b><small>${person.online ? 'Çevrimiçi' : 'Mesajlaşma'}</small></span></button>`).join('');
+  $$('[data-dm-friend]').forEach(button => button.onclick = () => openDirectChat(state.friends.friends.find(person => person.id === button.dataset.dmFriend)));
+}
+function appendDirectMessage(message) {
+  if (!message?.id || state.dmMessages.some(item => item.id === message.id)) return;
+  state.dmMessages.push(message); state.dmMessages = state.dmMessages.slice(-100); renderDirectMessages();
+}
+function renderDirectMessages() {
+  const box = $('#dmMessages'); if (!box) return;
+  box.innerHTML = state.dmMessages.length ? state.dmMessages.map(message => `<article class="community-message"><span class="community-avatar">${escapeHtml(initials(message.fromUsername))}</span><div><b>${escapeHtml(message.fromUsername)}</b><p>${escapeHtml(message.text)}</p><time>${new Date(message.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</time></div></article>`).join('') : '<div class="chat-welcome">Sohbeti başlatmak için bir mesaj yaz.</div>';
+  box.scrollTop = box.scrollHeight;
+}
 function renderRoomFeatures() {
   if (!state.room) return;
   renderPoll();
@@ -367,8 +449,10 @@ function renderRoomFeatures() {
 }
 function renderNotifications() {
   const unread = state.notifications.filter(item => !item.read).length; $('#notificationCount').textContent = unread > 9 ? '9+' : String(unread); $('#notificationCount').classList.toggle('hidden', !unread);
-  $('#notificationList').innerHTML = state.notifications.length ? state.notifications.map(item => `<article class="activity-row ${item.read ? '' : 'unread'}"><div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.message)} · ${new Date(item.createdAt).toLocaleString('tr-TR')}</span></div>${item.roomId ? `<button class="button button-outline" data-notification-room="${escapeHtml(item.roomId)}">Odaya git</button>` : ''}</article>`).join('') : '<p class="activity-empty">Yeni bildirimin yok.</p>';
+  $('#notificationList').innerHTML = state.notifications.length ? state.notifications.map(item => `<article class="activity-row ${item.read ? '' : 'unread'}"><div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.message)} · ${new Date(item.createdAt).toLocaleString('tr-TR')}</span></div>${item.type === 'friend-request' && item.metadata?.friendRequestId ? `<button class="button button-outline" data-notification-friend-accept="${escapeHtml(item.metadata.friendRequestId)}">Kabul</button><button class="button button-quiet" data-notification-friend-reject="${escapeHtml(item.metadata.friendRequestId)}">Reddet</button>` : ''}${item.type === 'direct-message' && item.metadata?.userId ? `<button class="button button-outline" data-notification-dm="${escapeHtml(item.metadata.userId)}">Sohbete git</button>` : ''}${item.roomId ? `<button class="button button-outline" data-notification-room="${escapeHtml(item.roomId)}">Odaya git</button>` : ''}</article>`).join('') : '<p class="activity-empty">Yeni bildirimin yok.</p>';
   $$('[data-notification-room]').forEach(button => button.onclick = () => { hideModals(); enterRoom(button.dataset.notificationRoom); });
+  $$('[data-notification-friend-accept],[data-notification-friend-reject]').forEach(button => button.onclick = async () => { try { await api(`/api/me/friends/requests/${encodeURIComponent(button.dataset.notificationFriendAccept || button.dataset.notificationFriendReject)}`, { method: 'POST', body: JSON.stringify({ accept: !!button.dataset.notificationFriendAccept }) }); state.notifications = state.notifications.map(item => item.metadata?.friendRequestId === (button.dataset.notificationFriendAccept || button.dataset.notificationFriendReject) ? { ...item, read: true } : item); renderNotifications(); await loadFriends(); if (!$('#communityView').classList.contains('hidden')) await loadCommunityMembers(); toast(button.dataset.notificationFriendAccept ? 'Arkadaşlık isteği kabul edildi.' : 'Arkadaşlık isteği reddedildi.'); } catch (error) { toast(error.message); } });
+  $$('[data-notification-dm]').forEach(button => button.onclick = async () => { hideModals(); activeView('community'); selectCommunityTab('dms'); try { await loadDirectFriends(); const friend = state.friends.friends.find(person => person.id === button.dataset.notificationDm); if (friend) await openDirectChat(friend); else toast('Bu kullanıcı artık arkadaş listende değil.'); } catch (error) { toast(error.message); } });
 }
 async function loadNotifications() { try { const stored = await api('/api/me/notifications'); const merged = new Map(state.notifications.map(item => [item.id, item])); for (const item of stored) merged.set(item.id, item); state.notifications = [...merged.values()].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50); renderNotifications(); } catch (error) { toast(error.message); } }
 async function loadProfileActivity() {
@@ -516,6 +600,11 @@ $('#logoutBtn').onclick = () => { leaveRoom(); state.socket?.disconnect(); state
 $('#heroCreate').onclick = $('#cardCreate')?.onclick || (() => showModal('createModal')); $('#newRoomSide').onclick = $('#heroCreate').onclick; $('#bottomCreate').onclick = $('#heroCreate').onclick;
 $('#heroJoin').onclick = () => showModal('joinModal'); $('#allRooms').onclick = () => { activeView('rooms'); refreshRooms(); }; $('#directoryRefresh').onclick = () => refreshRooms().then(() => toast('Odalar yenilendi.')); $('#directoryCreate').onclick = () => showModal('createModal');
 $('#roomFilterQuery').oninput = $('#roomFilterMood').onchange = $('#roomMinListeners').onchange = $('#roomSort').onchange = renderRoomDirectory;
+$('#communityRefresh').onclick = () => loadCommunityMembers().then(() => toast('Üye listesi yenilendi.'));
+$('#communitySearch').oninput = () => { state.communityPage = 0; clearTimeout(communityMemberTimer); communityMemberTimer = setTimeout(loadCommunityMembers, 220); };
+$$('.community-tab').forEach(button => button.onclick = () => selectCommunityTab(button.dataset.communityTab));
+$('#communityChatForm').onsubmit = event => { event.preventDefault(); const input = $('#communityChatInput'); const text = input.value.trim(); if (!text) return; state.socket?.emit('community:chat:send', { text }, result => { if (result?.error) toast(result.error); else input.value = ''; }); };
+$('#dmChatForm').onsubmit = event => { event.preventDefault(); const input = $('#dmChatInput'); const text = input.value.trim(); if (!text || !state.activeDmFriend) return; state.socket?.emit('dm:send', { friendId: state.activeDmFriend.id, text }, result => { if (result?.error) toast(result.error); else input.value = ''; }); };
 $('#createRoomForm').onsubmit = async e => { e.preventDefault(); if (!requireUser()) return; const data = new FormData(e.currentTarget); try { const room = await api('/api/rooms', { method: 'POST', body: JSON.stringify({ name: data.get('name'), mood: data.get('mood'), visibility: data.get('visibility') }) }); hideModals(); enterRoom(room.roomId); } catch (error) { $('#createError').textContent = error.message; } };
 $('#joinForm').onsubmit = e => { e.preventDefault(); let roomId = new FormData(e.currentTarget).get('code').trim(); try { const parsed = new URL(roomId, location.href); roomId = parsed.searchParams.get('room') || parsed.pathname.split('/').filter(Boolean).at(-1) || roomId; } catch {} hideModals(); if (!state.user) { state.pendingRoom = roomId; return modalAuth('login'); } enterRoom(roomId); };
 $('#backHome').onclick = () => { leaveRoom(); location.hash = '#home'; }; $('#profileBack').onclick = () => { activeView('home'); location.hash = '#home'; };
@@ -596,6 +685,7 @@ window.addEventListener('storage', async event => {
 function routeHash() {
   const route = location.hash.split('/')[0];
   if (route === '#room') { activeView('rooms'); refreshRooms(); }
+  else if (route === '#community') { if (!state.user) { state.pendingView = 'community'; return modalAuth('login'); } activeView('community'); selectCommunityTab(state.communityTab || 'members'); }
   else if (route === '#profile') { if (state.user) $('#profileOpen').click(); else { state.pendingView = 'profile'; modalAuth('login'); } }
   else { activeView('home'); }
 }
