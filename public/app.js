@@ -2,7 +2,7 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const savedToken = localStorage.getItem('km_token') || sessionStorage.getItem('km_token') || '';
 if (savedToken && !localStorage.getItem('km_token') && sessionStorage.getItem('km_remember') !== '0') localStorage.setItem('km_token', savedToken);
-const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
+const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, ytLoaded: false, localTrack: null, isDj: false, isHost: false, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, toastTimer: null };
 const api = async (url, options = {}) => {
   const headers = { ...(options.body && !(options.body instanceof Blob) && !(options.body instanceof ArrayBuffer) ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
@@ -53,8 +53,17 @@ function connectSocket() {
   if (!state.socket) { state.socket = io({ auth: { token: state.token } }); state.socketConfigured = false; state.socket.on('connect_error', err => { if (state.token) toast(err.message || 'Canlı bağlantı kurulamadı.'); }); state.socket.on('auth:revoked', () => { leaveRoom(); state.socket?.disconnect(); state.socket = null; state.socketConfigured = false; state.token = ''; state.user = null; localStorage.removeItem('km_token'); sessionStorage.removeItem('km_token'); sessionStorage.removeItem('km_remember'); setAuthHeader(); toast('Hesap oturumu sona erdi. Yeniden giriş yap.'); }); }
   if (!state.socketConfigured) {
     state.socket.on('rooms:update', () => refreshRooms());
+    state.socket.on('catalog:update', () => {
+      if (state.source === 'library' && $('#trackSearch').value.trim()) searchTracks();
+      if (state.user?.isAdmin && !$('#adminCatalogPane').classList.contains('hidden')) loadAdminTracks();
+    });
     state.socket.on('notification:new', notification => { state.notifications.unshift(notification); renderNotifications(); toast(notification.title); });
     state.socket.on('user:history', () => { if (!$('#profileView').classList.contains('hidden')) loadProfileActivity(); });
+    state.socket.on('room:session:replaced', event => {
+      if (event?.roomId !== state.room?.roomId) return;
+      leaveRoom({ notifyServer: false });
+      toast('Bu hesap odada başka bir sekmede açıldığı için bu oturum odadan çıkarıldı.');
+    });
     state.socket.on('connect', () => { refreshRooms(); if (state.socketConnectedBefore && state.room) enterRoom(state.room.roomId); state.socketConnectedBefore = true; });
     state.socketConfigured = true;
   }
@@ -82,10 +91,10 @@ function enterRoom(roomId) {
   state.socket.emit('room:join', { roomId }, response => {
     if (roomEpoch !== state.roomEpoch) return;
     if (response?.error) { toast(response.error); return; }
-    state.room = response.room; state.queue = response.room.queue || []; state.participants = response.room.participants || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.playbackNeedsGesture = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; renderRoomFeatures();
+    state.room = response.room; state.queue = response.room.queue || []; state.participants = uniqueParticipants(response.room.participants || []); state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.playbackNeedsGesture = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; renderRoomFeatures();
     $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); $('#roomVisibility').textContent = response.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
     state.socket.off('room:queue').on('room:queue', update => { if (!state.room || update?.roomId !== state.room.roomId) return; const queue = update.queue || []; const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
-    state.socket.off('room:participants').on('room:participants', update => { if (!state.room || update?.roomId !== state.room.roomId) return; state.participants = update.participants || []; renderParticipants(); renderRoomFeatures(); syncPeers(state.participants); });
+    state.socket.off('room:participants').on('room:participants', update => { if (!state.room || update?.roomId !== state.room.roomId) return; state.participants = uniqueParticipants(update.participants || []); renderParticipants(); renderRoomFeatures(); syncPeers(state.participants); });
     state.socket.off('room:playback').on('room:playback', playback => { if (playback?.roomId === state.room?.roomId) applyPlayback(playback); });
     state.socket.off('room:history').on('room:history', event => { if (event?.roomId !== state.room?.roomId) return; state.room.history = [event.entry, ...(state.room.history || [])].slice(0, 30); renderRoomFeatures(); });
     state.socket.off('room:stats').on('room:stats', event => { if (event?.roomId !== state.room?.roomId) return; state.room.statistics = event.statistics; renderRoomFeatures(); });
@@ -104,7 +113,9 @@ function enterRoom(roomId) {
     if (response.room.playback?.track && Number.isInteger(response.room.playback.index)) { state.selectedTrack = response.room.playback.index; const elapsed = response.room.playback.playing ? Math.max(0, (Date.now() - (response.room.playback.serverTime || Date.now())) / 1000) : 0; loadTrackMedia(response.room.playback.track, (response.room.playback.position || 0) + elapsed, response.room.playback.playing); }
   });
 }
+function uniqueParticipants(participants) { return [...new Map(participants.map(person => [person.userId || person.id, person])).values()]; }
 function renderParticipants() {
+  state.participants = uniqueParticipants(state.participants);
   const ownerId = $('#participantList').dataset.owner;
   $('#participantCount').textContent = `${state.participants.length} kişi`;
   $('#participantList').innerHTML = state.participants.map(p => `<div class="participant" data-person="${escapeHtml(p.id)}"><span class="participant-avatar">${p.avatar ? `<img src="${escapeHtml(p.avatar)}" alt="" />` : escapeHtml(initials(p.username))}</span><span>${p.userId === state.user?.id ? `${escapeHtml(p.username)} (sen)` : `<button class="participant-profile-link" data-profile-view="${escapeHtml(p.username)}">${escapeHtml(p.username)}</button>`}</span>${p.micOn ? '<span class="media-indicator">MIC</span>' : ''}${p.cameraOn ? '<span class="media-indicator">CAM</span>' : ''}${p.userId === ownerId ? '<span class="participant-role">SAHİP</span>' : p.isDj ? '<span class="participant-role">DJ</span>' : ''}${p.userId !== state.user?.id && (state.isHost || state.user?.isAdmin || state.isDj) ? `<button class="participant-more" data-person-menu="${escapeHtml(p.userId)}" title="Üye işlemleri">···</button>` : ''}</div>`).join('') || '<div class="side-empty">Katılımcılar yükleniyor.</div>';
@@ -140,15 +151,17 @@ function addTrack(track) {
 }
 async function searchTracks() {
   const q = $('#trackSearch').value.trim(); if (!q) return;
+  const requestId = ++state.catalogSearchRequest;
   $('#searchResults').innerHTML = '<div class="search-hint">Aranıyor…</div>';
   try {
     let items;
     if (state.source === 'youtube') items = (await api(`/api/youtube/search?q=${encodeURIComponent(q)}`)).items;
     else { const catalog = await api('/api/catalog'); items = catalog.filter(t => `${t.title} ${t.artist}`.toLowerCase().includes(q.toLowerCase())).map(t => ({ ...t, id: t._id, thumbnail: '' })); }
+    if (requestId !== state.catalogSearchRequest) return;
     $('#searchResults').innerHTML = items?.length ? items.map(item => `<div class="search-result"><img src="${escapeHtml(item.thumbnail || '')}" alt="" /><div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.artist)}</span></div><button data-add-track="${escapeHtml(item.id)}" title="Kuyruğa ekle">＋</button></div>`).join('') : '<div class="search-hint">Sonuç bulunamadı.</div>';
     renderPlaybackPermissions();
     $$('[data-add-track]').forEach(button => button.addEventListener('click', () => { const item = items.find(x => x.id === button.dataset.addTrack); addTrack(state.source === 'youtube' ? { title: item.title, artist: item.artist, source: 'youtube', videoId: item.id, thumbnail: item.thumbnail } : { title: item.title, artist: item.artist, source: 'library', url: item.url }); }));
-  } catch (e) { $('#searchResults').innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`; }
+  } catch (e) { if (requestId === state.catalogSearchRequest) $('#searchResults').innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`; }
 }
 function parseYouTube(value) { try { const u = new URL(value); const host = u.hostname.replace(/^www\./, '').toLowerCase(); if (!['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(host)) return ''; let id = host === 'youtu.be' ? u.pathname.slice(1) : u.searchParams.get('v'); if (host !== 'youtu.be' && u.pathname.startsWith('/embed/')) id = u.pathname.split('/')[2]; return /^[A-Za-z0-9_-]{11}$/.test(id || '') ? id : ''; } catch { return ''; } }
 async function ytSearchId(videoId) {

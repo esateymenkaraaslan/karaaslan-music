@@ -305,6 +305,7 @@ app.delete('/api/admin/tracks/:id', auth, admin, async (req, res) => {
     const playingIn = await db.collection('rooms').find({ 'playback.track.url': track.url }).toArray();
     for (const room of playingIn) { const playback = { ...(room.playback || {}), roomId: room.roomId, revision: (room.playback?.revision || 0) + 1, playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() }; await db.collection('rooms').updateOne({ roomId: room.roomId }, { $set: { playback } }); io.to(room.roomId).emit('room:playback', playback); }
   }
+  io.emit('catalog:update');
   res.json({ ok: true });
 });
 app.post('/api/admin/tracks', auth, admin, express.raw({ type: ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/wave', 'audio/ogg', 'audio/mp4', 'audio/x-m4a', 'audio/aac', 'audio/x-aac', 'audio/flac', 'audio/x-flac'], limit: '30mb' }), async (req, res) => {
@@ -314,14 +315,22 @@ app.post('/api/admin/tracks', auth, admin, express.raw({ type: ['audio/mpeg', 'a
   if (!ext) return res.status(415).json({ error: 'Desteklenmeyen ses biçimi.' });
   const id = await storeMedia(req.body, `${crypto.randomUUID()}${ext}`, mime);
   const track = { title: String(req.query.title || 'İsimsiz şarkı').slice(0, 120), artist: String(req.query.artist || 'Bilinmeyen sanatçı').slice(0, 120), source: 'library', url: `/media/${id.toString()}`, createdAt: new Date() };
-  const result = await db.collection('tracks').insertOne(track); res.status(201).json({ ...track, id: result.insertedId.toString() });
+  const result = await db.collection('tracks').insertOne(track); io.emit('catalog:update'); res.status(201).json({ ...track, id: result.insertedId.toString() });
 });
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const roomState = new Map();
 const roomPlaybackControlAt = new Map();
 const roomPlaybackQueues = new Map();
+const roomJoinQueues = new Map();
 const roomListenStatsAt = new Map();
+function queueRoomJoin(roomId, work) {
+  const previous = roomJoinQueues.get(roomId) || Promise.resolve();
+  const current = previous.catch(() => {}).then(work);
+  roomJoinQueues.set(roomId, current);
+  current.finally(() => { if (roomJoinQueues.get(roomId) === current) roomJoinQueues.delete(roomId); }).catch(() => {});
+  return current;
+}
 function queuePlaybackWrite(roomId, work) {
   const previous = roomPlaybackQueues.get(roomId) || Promise.resolve();
   const current = previous.catch(() => {}).then(work);
@@ -354,19 +363,29 @@ io.on('connection', socket => {
     if (socket.data.roomId && socket.data.roomId !== roomId) { try { await leaveCurrentRoom(socket); } catch (error) { console.error('Room switch cleanup failed:', error.message); return done({ error: 'Önceki odadan ayrılırken bağlantı hatası oluştu.' }); } }
     roomId = String(roomId || '').trim().slice(0, 40);
     if (!/^[a-zA-Z0-9_-]{3,40}$/.test(roomId)) return done({ error: 'Oda kodu geçersiz.' });
-    const room = await db.collection('rooms').findOne({ roomId });
-    if (!room) return done({ error: 'Bu oda artık mevcut değil.' });
-    const set = roomState.get(roomId) || new Map();
-    if (set.size >= 20 && !set.has(socket.id)) return done({ error: 'Oda dolu (en fazla 20 kişi).' });
-    const dbUser = await db.collection('users').findOne({ _id: new ObjectId(socket.user.sub) });
-    const participant = { id: socket.id, userId: socket.user.sub, username: dbUser?.username || username || 'Dinleyici', avatar: dbUser?.avatar || '', isAdmin: !!socket.user.admin, isHost: room.hostId === socket.user.sub, isDj: room.hostId === socket.user.sub || !!socket.user.admin || (room.djIds || []).includes(socket.user.sub), micOn: false, cameraOn: false };
-    await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $pull: { recentRooms: { roomId } } });
-    await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $push: { recentRooms: { $each: [{ roomId, name: room.name, mood: room.mood, joinedAt: new Date() }], $position: 0, $slice: 25 } } });
-    set.set(socket.id, participant); roomState.set(roomId, set); socket.join(roomId); socket.data.roomId = roomId; socket.data.participant = participant;
-    done({ room: { roomId, name: room.name, mood: room.mood, visibility: room.visibility || 'public', hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId }, participants: [...set.values()], history: room.history || [], requests: room.requests || [], announcement: room.announcement || '', statistics: room.statistics || { plays: 0, seconds: 0 } } });
-    if (room.playback?.playing) socket.emit('room:playback', { ...room.playback, roomId });
-    io.to(roomId).emit('room:participants', { roomId, participants: [...set.values()] });
-    io.emit('rooms:update');
+    return queueRoomJoin(roomId, async () => {
+      const room = await db.collection('rooms').findOne({ roomId });
+      if (!room) return done({ error: 'Bu oda artık mevcut değil.' });
+      let set = roomState.get(roomId) || new Map();
+      const existing = [...set.entries()].find(([id, person]) => id !== socket.id && person.userId === socket.user.sub);
+      if (existing) {
+        const previousSocket = io.sockets.sockets.get(existing[0]);
+        previousSocket?.emit('room:session:replaced', { roomId });
+        if (previousSocket) await leaveCurrentRoom(previousSocket);
+        else set.delete(existing[0]);
+        set = roomState.get(roomId) || new Map();
+      }
+      if (set.size >= 20 && !set.has(socket.id)) return done({ error: 'Oda dolu (en fazla 20 kişi).' });
+      const dbUser = await db.collection('users').findOne({ _id: new ObjectId(socket.user.sub) });
+      const participant = { id: socket.id, userId: socket.user.sub, username: dbUser?.username || username || 'Dinleyici', avatar: dbUser?.avatar || '', isAdmin: !!socket.user.admin, isHost: room.hostId === socket.user.sub, isDj: room.hostId === socket.user.sub || !!socket.user.admin || (room.djIds || []).includes(socket.user.sub), micOn: false, cameraOn: false };
+      await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $pull: { recentRooms: { roomId } } });
+      await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $push: { recentRooms: { $each: [{ roomId, name: room.name, mood: room.mood, joinedAt: new Date() }], $position: 0, $slice: 25 } } });
+      set.set(socket.id, participant); roomState.set(roomId, set); socket.join(roomId); socket.data.roomId = roomId; socket.data.participant = participant;
+      done({ room: { roomId, name: room.name, mood: room.mood, visibility: room.visibility || 'public', hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId }, participants: [...set.values()], history: room.history || [], requests: room.requests || [], announcement: room.announcement || '', statistics: room.statistics || { plays: 0, seconds: 0 } } });
+      if (room.playback?.playing) socket.emit('room:playback', { ...room.playback, roomId });
+      io.to(roomId).emit('room:participants', { roomId, participants: [...set.values()] });
+      io.emit('rooms:update');
+    });
   });
   onAsyncSocket(socket, 'room:queue:add', async (track, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId) return done({ error: 'Önce odaya katıl.' });
