@@ -91,10 +91,11 @@ function renderRoomDirectory() {
 function activeView(name) { $('#homeView').classList.toggle('hidden', name !== 'home'); $('#roomsDirectoryView').classList.toggle('hidden', name !== 'rooms'); $('#roomView').classList.toggle('hidden', name !== 'room'); $('#profileView').classList.toggle('hidden', name !== 'profile'); $('#pageCrumb').textContent = name === 'room' ? 'Dinleme odası' : name === 'rooms' ? 'Dinleme odaları' : name === 'profile' ? 'Profilim' : 'Senin için'; $$('.main-nav .nav-item').forEach(item => item.classList.toggle('active', item.hash === (name === 'profile' ? '#profile' : name === 'rooms' || name === 'room' ? '#room' : '#home'))); window.scrollTo({ top: 0, behavior: 'smooth' }); }
 function enterRoom(roomId) {
   if (!requireUser()) return;
+  roomId = String(roomId || '').trim();
+  if (state.room?.roomId === roomId) { activeView('room'); return; }
   if (state.room || state.selectedTrack !== null || state.roomEpoch > 0) leaveRoom({ notifyServer: false, navigate: false });
   else state.roomEpoch += 1;
   const roomEpoch = state.roomEpoch;
-  roomId = String(roomId || '').trim();
   try { connectSocket(); } catch (e) { toast(e.message); return; }
   state.socket.emit('room:join', { roomId }, response => {
     if (roomEpoch !== state.roomEpoch) return;
