@@ -232,9 +232,9 @@ app.get('/api/me/dms/:friendId', auth, async (req, res) => {
   if (!(await areFriends(req.user.sub, friendId))) return res.status(403).json({ error: 'Özel mesajlar yalnızca arkadaşlar arasında kullanılabilir.' });
   const messages = await db.collection('directMessages').find({ $or: [{ fromId: req.user.sub, toId: friendId }, { fromId: friendId, toId: req.user.sub }] }).sort({ createdAt: -1 }).limit(100).toArray();
   const senderIds = [...new Set(messages.map(item => item.fromId))].filter(ObjectId.isValid).map(value => new ObjectId(value));
-  const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { username: 1 } }).toArray() : [];
-  const usernames = new Map(senders.map(person => [person._id.toString(), person.username]));
-  res.json(messages.reverse().map(item => ({ id: item._id.toString(), fromId: item.fromId, fromUsername: usernames.get(item.fromId) || '', text: item.text, createdAt: item.createdAt })));
+  const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { username: 1, avatar: 1 } }).toArray() : [];
+  const senderDetails = new Map(senders.map(person => [person._id.toString(), { username: person.username, avatar: person.avatar || '' }]));
+  res.json(messages.reverse().map(item => ({ id: item._id.toString(), fromId: item.fromId, fromUsername: senderDetails.get(item.fromId)?.username || '', avatar: senderDetails.get(item.fromId)?.avatar || '', text: item.text, createdAt: item.createdAt })));
 });
 app.post('/api/rooms/:roomId/invite-friend', auth, async (req, res) => {
   const roomId = String(req.params.roomId || '').slice(0, 40); const friendId = String(req.body.friendId || '');
@@ -271,7 +271,10 @@ app.delete('/api/me/playlists/:id', auth, async (req, res) => {
   const result = await db.collection('playlists').deleteOne({ _id: new ObjectId(req.params.id), userId: req.user.sub });
   if (!result.deletedCount) return res.status(404).json({ error: 'Liste bulunamadı.' }); res.json({ ok: true });
 });
-app.get('/api/me/notifications', auth, async (req, res) => res.json(await db.collection('notifications').find({ userId: req.user.sub }).sort({ createdAt: -1 }).limit(50).toArray()));
+app.get('/api/me/notifications', auth, async (req, res) => {
+  const items = await db.collection('notifications').find({ userId: req.user.sub }).sort({ createdAt: -1 }).limit(50).toArray();
+  res.json(items.map(({ _id, ...item }) => ({ ...item, id: _id.toString() })));
+});
 app.post('/api/me/notifications/read', auth, async (req, res) => { await db.collection('notifications').updateMany({ userId: req.user.sub, read: false }, { $set: { read: true } }); res.json({ ok: true }); });
 app.post('/api/me/avatar', auth, express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '2mb' }), async (req, res) => {
   if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'Profil resmi gönderilmedi.' });
@@ -485,15 +488,19 @@ io.on('connection', socket => {
   onAsyncSocket(socket, 'community:chat:join', async (_payload, done = () => {}) => {
     socket.join('community:chat');
     const messages = await db.collection('communityMessages').find({}).sort({ createdAt: -1 }).limit(100).toArray();
-    done({ messages: messages.reverse().map(item => ({ id: item._id.toString(), username: item.username, text: item.text, createdAt: item.createdAt })) });
+    const senderIds = [...new Set(messages.map(item => item.userId).filter(ObjectId.isValid))].map(value => new ObjectId(value));
+    const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { avatar: 1 } }).toArray() : [];
+    const avatars = new Map(senders.map(person => [person._id.toString(), person.avatar || '']));
+    done({ messages: messages.reverse().map(item => ({ id: item._id.toString(), username: item.username, avatar: avatars.get(item.userId) || item.avatar || '', text: item.text, createdAt: item.createdAt })) });
   });
   onAsyncSocket(socket, 'community:chat:send', async ({ text } = {}, done = () => {}) => {
     const message = String(text || '').trim().slice(0, 500);
     if (!message) return done({ error: 'Mesaj boş olamaz.' });
     if (!allowSocketEvent(socket, 'community-chat', 8, 5_000)) return done({ error: 'Sohbete çok hızlı mesaj gönderiyorsun. Biraz bekle.' });
-    const item = { username: socket.user.username, userId: socket.user.sub, text: message, createdAt: new Date() };
+    const sender = await db.collection('users').findOne({ _id: new ObjectId(socket.user.sub) }, { projection: { avatar: 1 } });
+    const item = { username: socket.user.username, userId: socket.user.sub, avatar: sender?.avatar || '', text: message, createdAt: new Date() };
     const result = await db.collection('communityMessages').insertOne(item);
-    const visible = { id: result.insertedId.toString(), username: item.username, text: item.text, createdAt: item.createdAt };
+    const visible = { id: result.insertedId.toString(), username: item.username, avatar: item.avatar, text: item.text, createdAt: item.createdAt };
     io.to('community:chat').emit('community:chat:message', visible); done({ ok: true });
   });
   onAsyncSocket(socket, 'dm:join', async ({ friendId } = {}, done = () => {}) => {
@@ -502,9 +509,9 @@ io.on('connection', socket => {
     const roomId = directRoomId(socket.user.sub, friendId); socket.data.dmRooms ||= new Set(); socket.data.dmRooms.add(roomId); socket.join(roomId);
     const raw = await db.collection('directMessages').find({ $or: [{ fromId: socket.user.sub, toId: friendId }, { fromId: friendId, toId: socket.user.sub }] }).sort({ createdAt: -1 }).limit(100).toArray();
     const senderIds = [...new Set(raw.map(item => item.fromId))].filter(ObjectId.isValid).map(value => new ObjectId(value));
-    const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { username: 1 } }).toArray() : [];
-    const usernames = new Map(senders.map(person => [person._id.toString(), person.username]));
-    done({ messages: raw.reverse().map(item => ({ id: item._id.toString(), fromId: item.fromId, fromUsername: usernames.get(item.fromId) || '', text: item.text, createdAt: item.createdAt })) });
+    const senders = senderIds.length ? await db.collection('users').find({ _id: { $in: senderIds } }, { projection: { username: 1, avatar: 1 } }).toArray() : [];
+    const senderDetails = new Map(senders.map(person => [person._id.toString(), { username: person.username, avatar: person.avatar || '' }]));
+    done({ messages: raw.reverse().map(item => ({ id: item._id.toString(), fromId: item.fromId, fromUsername: senderDetails.get(item.fromId)?.username || '', avatar: senderDetails.get(item.fromId)?.avatar || '', text: item.text, createdAt: item.createdAt })) });
   });
   onAsyncSocket(socket, 'dm:leave', async ({ friendId } = {}) => {
     const roomId = directRoomId(socket.user.sub, String(friendId || ''));
@@ -515,9 +522,10 @@ io.on('connection', socket => {
     if (!message) return done({ error: 'Mesaj boş olamaz.' });
     if (!allowSocketEvent(socket, 'direct-message', 12, 5_000)) return done({ error: 'Çok hızlı mesaj gönderiyorsun. Biraz bekle.' });
     if (!(await areFriends(socket.user.sub, friendId))) return done({ error: 'Özel mesaj yalnızca arkadaşlar arasında kullanılabilir.' });
-    const item = { fromId: socket.user.sub, toId: friendId, fromUsername: socket.user.username, text: message, createdAt: new Date() };
+    const sender = await db.collection('users').findOne({ _id: new ObjectId(socket.user.sub) }, { projection: { avatar: 1 } });
+    const item = { fromId: socket.user.sub, toId: friendId, fromUsername: socket.user.username, avatar: sender?.avatar || '', text: message, createdAt: new Date() };
     const result = await db.collection('directMessages').insertOne(item);
-    const visible = { id: result.insertedId.toString(), fromId: item.fromId, fromUsername: item.fromUsername, text: item.text, createdAt: item.createdAt };
+    const visible = { id: result.insertedId.toString(), fromId: item.fromId, fromUsername: item.fromUsername, avatar: item.avatar, text: item.text, createdAt: item.createdAt };
     for (const socketId of io.sockets.adapter.rooms.get(directRoomId(item.fromId, friendId)) || []) {
       const recipient = io.sockets.sockets.get(socketId);
       recipient?.emit('dm:message', { friendId: recipient.user?.sub === item.fromId ? friendId : item.fromId, message: visible });
@@ -595,15 +603,16 @@ io.on('connection', socket => {
     const playback = index < 0 ? { ...(room?.playback || {}), roomId, revision: (room?.playback?.revision || 0) + 1, playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() } : { ...room.playback, roomId, revision: (room.playback?.revision || 0) + 1, index, track: sanitized[index], updatedAt: new Date(), serverTime: Date.now() };
     await db.collection('rooms').updateOne({ roomId }, { $set: { queue: sanitized, playback } }); io.to(roomId).emit('room:queue', { roomId, queue: sanitized }); io.to(roomId).emit('room:playback', playback); scheduleRoomsUpdate();
   });
-  onAsyncSocket(socket, 'room:queue:remove', async trackId => {
-    const roomId = socket.data.roomId; if (!roomId) return;
+  onAsyncSocket(socket, 'room:queue:remove', async (trackId, done = () => {}) => {
+    const roomId = socket.data.roomId; if (!roomId) return done({ error: 'Önce odaya katıl.' });
     const person = roomState.get(roomId)?.get(socket.id); const room = await db.collection('rooms').findOne({ roomId });
-    if (!person?.isDj && room?.hostId !== socket.user.sub) return;
-    const oldQueue = room?.queue || []; const removedIndex = oldQueue.findIndex(item => item.id === trackId); if (removedIndex < 0) return;
+    if (!room) return done({ error: 'Oda bulunamadı.' });
+    if (!person?.isDj && room.hostId !== socket.user.sub && !socket.user.admin) return done({ error: 'Şarkıyı yalnızca oda sahibi veya DJ kaldırabilir.' });
+    const oldQueue = room.queue || []; const removedIndex = oldQueue.findIndex(item => item.id === trackId); if (removedIndex < 0) return done({ error: 'Bu şarkı kuyrukta bulunamadı; liste güncelleniyor.' });
     const queue = oldQueue.filter(x => x.id !== trackId); let playback = room.playback || { playing: false, position: 0 };
     if (playback.track?.id === trackId) playback = { ...playback, roomId, revision: (playback.revision || 0) + 1, playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() };
     else if (Number.isInteger(playback.index) && removedIndex < playback.index) playback = { ...playback, roomId, revision: (playback.revision || 0) + 1, index: playback.index - 1, updatedAt: new Date(), serverTime: Date.now() };
-    await db.collection('rooms').updateOne({ roomId }, { $set: { queue, playback } }); io.to(roomId).emit('room:queue', { roomId, queue }); io.to(roomId).emit('room:playback', { ...playback, roomId }); scheduleRoomsUpdate();
+    await db.collection('rooms').updateOne({ roomId }, { $set: { queue, playback } }); io.to(roomId).emit('room:queue', { roomId, queue }); io.to(roomId).emit('room:playback', { ...playback, roomId }); scheduleRoomsUpdate(); done({ ok: true });
   });
   onAsyncSocket(socket, 'room:playback:sync', async (done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }, { projection: { playback: 1 } }) : null;

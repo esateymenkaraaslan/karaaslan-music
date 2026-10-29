@@ -16,6 +16,8 @@ function showModal(id) { $(`#${id}`).classList.remove('hidden'); }
 function hideModals() { $$('.modal-backdrop').forEach(el => el.classList.add('hidden')); }
 function escapeHtml(str = '') { return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
 function initials(name = '?') { return [...name.trim()][0]?.toLocaleUpperCase('tr-TR') || '?'; }
+function communityAvatarMarkup(name, avatar = '') { return `<span class="community-avatar">${avatar ? `<img src="${escapeHtml(avatar)}" data-avatar-name="${escapeHtml(name)}" alt="" />` : escapeHtml(initials(name))}</span>`; }
+function bindCommunityAvatarFallbacks(root) { $$('img[data-avatar-name]', root).forEach(image => { image.onerror = () => { image.parentElement.textContent = initials(image.dataset.avatarName); }; }); }
 function setAvatar(element, avatar, name) { if (!element) return; element.textContent = avatar ? '' : initials(name); element.style.background = ''; if (avatar) { element.style.backgroundImage = `url("${avatar}")`; element.style.backgroundSize = 'cover'; element.style.backgroundPosition = 'center'; } element.classList.toggle('has-avatar', !!avatar); }
 function setTheme(theme) { const chosen = theme === 'light' ? 'light' : 'dark'; document.body.classList.toggle('light', chosen === 'light'); localStorage.setItem('km_theme', chosen); const label = chosen === 'dark' ? 'Açık görünüm' : 'Koyu görünüm'; $('.theme-toggle span:nth-child(2)').textContent = label; if (state.user && state.token) api('/api/me', { method: 'PATCH', body: JSON.stringify({ theme: chosen }) }).catch(() => {}); }
 function setAuthHeader() {
@@ -190,7 +192,7 @@ function renderQueue() {
   if (!state.queue.length) { $('#queueList').innerHTML = '<div class="queue-empty"><span>♫</span><b>Sıra henüz boş</b><small>Yukarıdan şarkı ara veya bağlantı ekle.</small></div>'; return; }
   $('#queueList').innerHTML = state.queue.map((track, i) => `<div class="queue-item" data-index="${i}"><span class="queue-index">${String(i + 1).padStart(2, '0')}</span>${track.thumbnail ? `<img class="queue-thumb" src="${escapeHtml(track.thumbnail)}" alt="" />` : '<span class="queue-thumb" style="display:grid;place-items:center;color:#c6ec82">♫</span>'}<span class="queue-track"><b>${escapeHtml(track.title)}</b><span>${escapeHtml(track.artist || track.addedBy || '—')}</span></span><span class="queue-source">${track.source === 'youtube' ? 'YT' : 'LOCAL'}</span><button class="queue-remove" data-play-index="${i}" title="Çal">▶</button>${state.isDj ? `<button class="queue-remove" data-remove-track="${escapeHtml(track.id)}" title="Kuyruktan kaldır">×</button>` : ''}</div>`).join('');
   $$('[data-play-index]').forEach(button => button.addEventListener('click', () => playAt(Number(button.dataset.playIndex))));
-  $$('[data-remove-track]').forEach(button => button.addEventListener('click', () => state.socket.emit('room:queue:remove', button.dataset.removeTrack)));
+  $$('[data-remove-track]').forEach(button => button.addEventListener('click', () => { button.disabled = true; state.socket.emit('room:queue:remove', button.dataset.removeTrack, result => { if (result?.error) { toast(result.error); button.disabled = false; } else toast('Şarkı kuyruktan kaldırıldı.'); }); }));
   renderPlaybackPermissions();
 }
 function addTrack(track) {
@@ -371,11 +373,11 @@ async function loadCommunityMembers() {
     if (state.communityPage >= state.communityPages) { state.communityPage = state.communityPages - 1; return loadCommunityMembers(); }
     $('#memberCount').textContent = state.communityTotal;
     $('#communityMembers').innerHTML = state.communityMembers.length ? state.communityMembers.map(person => {
-      const avatar = person.avatar ? `<img src="${escapeHtml(person.avatar)}" alt="" />` : escapeHtml(initials(person.username));
       const status = person.online ? 'Çevrimiçi' : person.status || 'Karaaslan Müzik üyesi';
       let action = person.isFriend ? `<button class="button button-outline" data-community-dm="${escapeHtml(person.id)}">Mesaj gönder</button>` : person.requestReceived ? `<button class="button button-primary" data-community-accept="${escapeHtml(person.requestId)}">İsteği kabul et</button>` : person.requestSent ? '<button class="button button-outline" disabled>İstek gönderildi</button>' : `<button class="button button-outline" data-community-request="${escapeHtml(person.username)}">Arkadaş ekle</button>`;
-      return `<article class="community-member"><span class="community-avatar">${avatar}</span><div class="community-member-copy"><b>${escapeHtml(person.username)}</b><span>${escapeHtml(status)}</span></div>${action}</article>`;
+      return `<article class="community-member">${communityAvatarMarkup(person.username, person.avatar)}<div class="community-member-copy"><b>${escapeHtml(person.username)}</b><span>${escapeHtml(status)}</span></div>${action}</article>`;
     }).join('') : '<p class="activity-empty">Bu aramayla eşleşen üye bulunamadı.</p>';
+    bindCommunityAvatarFallbacks($('#communityMembers'));
     $$('[data-community-request]').forEach(button => button.onclick = async () => { try { await api('/api/me/friends/request', { method: 'POST', body: JSON.stringify({ username: button.dataset.communityRequest }) }); toast('Arkadaşlık isteği gönderildi; karşı tarafa bildirim gitti.'); await loadCommunityMembers(); } catch (error) { toast(error.message); } });
     $$('[data-community-accept]').forEach(button => button.onclick = async () => { try { await api(`/api/me/friends/requests/${encodeURIComponent(button.dataset.communityAccept)}`, { method: 'POST', body: JSON.stringify({ accept: true }) }); toast('Arkadaşlık isteği kabul edildi.'); await loadCommunityMembers(); await loadFriends(); } catch (error) { toast(error.message); } });
     $$('[data-community-dm]').forEach(button => button.onclick = async () => { await openDirectChat(state.friends.friends.find(person => person.id === button.dataset.communityDm) || { id: button.dataset.communityDm, username: button.closest('.community-member').querySelector('.community-member-copy b').textContent }); selectCommunityTab('dms'); });
@@ -402,13 +404,15 @@ function appendCommunityMessage(message) {
 }
 function renderCommunityMessages() {
   const box = $('#communityMessages'); if (!box) return;
-  box.innerHTML = state.communityMessages.length ? state.communityMessages.map(message => `<article class="community-message"><span class="community-avatar">${escapeHtml(initials(message.username))}</span><div><b>${escapeHtml(message.username)}</b><p>${escapeHtml(message.text)}</p><time>${new Date(message.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</time></div></article>`).join('') : '<div class="chat-welcome">Genel sohbette henüz mesaj yok. İlk mesajı sen yaz.</div>';
+  box.innerHTML = state.communityMessages.length ? state.communityMessages.map(message => `<article class="community-message">${communityAvatarMarkup(message.username, message.avatar)}<div><b>${escapeHtml(message.username)}</b><p>${escapeHtml(message.text)}</p><time>${new Date(message.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</time></div></article>`).join('') : '<div class="chat-welcome">Genel sohbette henüz mesaj yok. İlk mesajı sen yaz.</div>';
+  bindCommunityAvatarFallbacks(box);
   box.scrollTop = box.scrollHeight;
 }
 async function loadDirectFriends() {
   if (!state.user) return;
   try { state.friends = await api('/api/me/friends');
-    $('#dmFriendList').innerHTML = state.friends.friends.length ? state.friends.friends.map(person => `<button type="button" class="dm-friend ${state.activeDmFriend?.id === person.id ? 'active' : ''}" data-dm-friend="${escapeHtml(person.id)}"><span class="community-avatar">${person.avatar ? `<img src="${escapeHtml(person.avatar)}" alt="" />` : escapeHtml(initials(person.username))}</span><span><b>${escapeHtml(person.username)}</b><small>${person.online ? 'Çevrimiçi' : 'Mesajlaşma'}</small></span></button>`).join('') : '<p class="activity-empty">Özel sohbet için önce arkadaş ekle.</p>';
+    $('#dmFriendList').innerHTML = state.friends.friends.length ? state.friends.friends.map(person => `<button type="button" class="dm-friend ${state.activeDmFriend?.id === person.id ? 'active' : ''}" data-dm-friend="${escapeHtml(person.id)}">${communityAvatarMarkup(person.username, person.avatar)}<span><b>${escapeHtml(person.username)}</b><small>${person.online ? 'Çevrimiçi' : 'Mesajlaşma'}</small></span></button>`).join('') : '<p class="activity-empty">Özel sohbet için önce arkadaş ekle.</p>';
+    bindCommunityAvatarFallbacks($('#dmFriendList'));
     $$('[data-dm-friend]').forEach(button => button.onclick = () => openDirectChat(state.friends.friends.find(person => person.id === button.dataset.dmFriend)));
   } catch (error) { $('#dmFriendList').textContent = error.message; }
 }
@@ -425,7 +429,8 @@ async function openDirectChat(friend) {
 }
 function renderDirectFriends() {
   const list = $('#dmFriendList'); if (!list || !state.friends.friends.length) return;
-  list.innerHTML = state.friends.friends.map(person => `<button type="button" class="dm-friend ${state.activeDmFriend?.id === person.id ? 'active' : ''}" data-dm-friend="${escapeHtml(person.id)}"><span class="community-avatar">${person.avatar ? `<img src="${escapeHtml(person.avatar)}" alt="" />` : escapeHtml(initials(person.username))}</span><span><b>${escapeHtml(person.username)}</b><small>${person.online ? 'Çevrimiçi' : 'Mesajlaşma'}</small></span></button>`).join('');
+  list.innerHTML = state.friends.friends.map(person => `<button type="button" class="dm-friend ${state.activeDmFriend?.id === person.id ? 'active' : ''}" data-dm-friend="${escapeHtml(person.id)}">${communityAvatarMarkup(person.username, person.avatar)}<span><b>${escapeHtml(person.username)}</b><small>${person.online ? 'Çevrimiçi' : 'Mesajlaşma'}</small></span></button>`).join('');
+  bindCommunityAvatarFallbacks(list);
   $$('[data-dm-friend]').forEach(button => button.onclick = () => openDirectChat(state.friends.friends.find(person => person.id === button.dataset.dmFriend)));
 }
 function appendDirectMessage(message) {
@@ -434,7 +439,8 @@ function appendDirectMessage(message) {
 }
 function renderDirectMessages() {
   const box = $('#dmMessages'); if (!box) return;
-  box.innerHTML = state.dmMessages.length ? state.dmMessages.map(message => `<article class="community-message"><span class="community-avatar">${escapeHtml(initials(message.fromUsername))}</span><div><b>${escapeHtml(message.fromUsername)}</b><p>${escapeHtml(message.text)}</p><time>${new Date(message.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</time></div></article>`).join('') : '<div class="chat-welcome">Sohbeti başlatmak için bir mesaj yaz.</div>';
+  box.innerHTML = state.dmMessages.length ? state.dmMessages.map(message => `<article class="community-message">${communityAvatarMarkup(message.fromUsername, message.avatar)}<div><b>${escapeHtml(message.fromUsername)}</b><p>${escapeHtml(message.text)}</p><time>${new Date(message.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</time></div></article>`).join('') : '<div class="chat-welcome">Sohbeti başlatmak için bir mesaj yaz.</div>';
+  bindCommunityAvatarFallbacks(box);
   box.scrollTop = box.scrollHeight;
 }
 function renderRoomFeatures() {

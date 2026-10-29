@@ -203,8 +203,8 @@ body.light{background:radial-gradient(ellipse at 76% 2%,#c2943a14,transparent 30
 .community-search{width:100%;height:46px;margin:0 0 15px;padding:0 14px;border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--text)}
 .community-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));gap:10px}
 .community-member{display:flex;align-items:center;gap:11px;min-width:0;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
-.community-avatar{width:38px;height:38px;display:grid;place-items:center;flex:none;overflow:hidden;border-radius:50%;background:var(--acid-dark);color:var(--acid);font-weight:700}
-.community-avatar img{width:100%;height:100%;object-fit:cover}
+.community-avatar{width:38px;height:38px;min-width:38px;min-height:38px;aspect-ratio:1;display:grid;place-items:center;flex:none;overflow:hidden;border-radius:50%;background:var(--acid-dark);color:var(--acid);font-weight:700}
+.community-avatar img{display:block;width:100%;height:100%;min-width:100%;min-height:100%;object-fit:cover;object-position:center;border-radius:inherit}
 .community-member-copy{display:grid;gap:4px;min-width:0;flex:1}
 .community-member-copy b,.dm-friend b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .community-member-copy span,.dm-friend small{color:var(--muted);font-size:11px}
