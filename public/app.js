@@ -43,6 +43,12 @@ async function refreshRooms() {
 }
 let roomsRefreshTimer;
 function scheduleRoomsRefresh() { clearTimeout(roomsRefreshTimer); roomsRefreshTimer = setTimeout(() => refreshRooms(), 450); }
+let profileActivityRefreshTimer;
+function scheduleProfileActivityRefresh() {
+  if ($('#profileView').classList.contains('hidden')) return;
+  clearTimeout(profileActivityRefreshTimer);
+  profileActivityRefreshTimer = setTimeout(() => loadProfileActivity(), 250);
+}
 function modalAuth(mode) {
   const next = state.pendingRoom ? `/?room=${encodeURIComponent(state.pendingRoom)}` : `${location.pathname}${location.search}${location.hash}`;
   const target = new URL('/auth.html', location.origin); target.searchParams.set('mode', mode === 'register' ? 'register' : 'login'); target.searchParams.set('next', next); location.assign(target);
@@ -64,15 +70,23 @@ function connectSocket() {
       if (state.source === 'library' && $('#trackSearch').value.trim()) searchTracks();
       if (state.user?.isAdmin && !$('#adminCatalogPane').classList.contains('hidden')) loadAdminTracks();
     });
-    state.socket.on('notification:new', notification => { state.notifications.unshift(notification); renderNotifications(); toast(notification.title); });
-    state.socket.on('user:history', () => { if (!$('#profileView').classList.contains('hidden')) loadProfileActivity(); });
-    state.socket.on('user:stats', () => { if (!$('#profileView').classList.contains('hidden')) loadProfileActivity(); });
+    state.socket.on('notification:new', notification => { if (!notification?.id || !state.notifications.some(item => item.id === notification.id)) state.notifications.unshift(notification); renderNotifications(); toast(notification.title); });
+    state.socket.on('user:history', scheduleProfileActivityRefresh);
+    state.socket.on('user:stats', scheduleProfileActivityRefresh);
     state.socket.on('room:session:replaced', event => {
       if (event?.roomId !== state.room?.roomId) return;
       leaveRoom({ notifyServer: false });
       toast('Bu hesap odada başka bir sekmede açıldığı için bu oturum odadan çıkarıldı.');
     });
-    state.socket.on('connect', () => { refreshRooms(); if (state.socketConnectedBefore && state.room) enterRoom(state.room.roomId); state.socketConnectedBefore = true; });
+    state.socket.on('connect', () => {
+      refreshRooms();
+      if (state.socketConnectedBefore) {
+        loadNotifications();
+        if (state.room) enterRoom(state.room.roomId, { forceRejoin: true });
+        if (!$('#profileView').classList.contains('hidden')) scheduleProfileActivityRefresh();
+      }
+      state.socketConnectedBefore = true;
+    });
     state.socketConfigured = true;
   }
   return state.socket;
@@ -89,11 +103,13 @@ function renderRoomDirectory() {
   $$('[data-favorite-room]').forEach(button => button.addEventListener('click', async () => { if (!state.user) return modalAuth('login'); try { const favorite = !button.classList.contains('active'); await api(`/api/me/favorites/rooms/${encodeURIComponent(button.dataset.favoriteRoom)}`, { method: 'PUT', body: JSON.stringify({ favorite }) }); state.user.favoriteRooms = state.user.favoriteRooms || []; state.user.favoriteRooms = favorite ? [...new Set([...state.user.favoriteRooms, button.dataset.favoriteRoom])] : state.user.favoriteRooms.filter(id => id !== button.dataset.favoriteRoom); await refreshRooms(); } catch (error) { toast(error.message); } }));
 }
 function activeView(name) { $('#homeView').classList.toggle('hidden', name !== 'home'); $('#roomsDirectoryView').classList.toggle('hidden', name !== 'rooms'); $('#roomView').classList.toggle('hidden', name !== 'room'); $('#profileView').classList.toggle('hidden', name !== 'profile'); $('#pageCrumb').textContent = name === 'room' ? 'Dinleme odası' : name === 'rooms' ? 'Dinleme odaları' : name === 'profile' ? 'Profilim' : 'Senin için'; $$('.main-nav .nav-item').forEach(item => item.classList.toggle('active', item.hash === (name === 'profile' ? '#profile' : name === 'rooms' || name === 'room' ? '#room' : '#home'))); window.scrollTo({ top: 0, behavior: 'smooth' }); }
-function enterRoom(roomId) {
+function enterRoom(roomId, { forceRejoin = false } = {}) {
   if (!requireUser()) return;
   roomId = String(roomId || '').trim();
-  if (state.room?.roomId === roomId) { activeView('room'); return; }
-  if (state.room || state.selectedTrack !== null || state.roomEpoch > 0) leaveRoom({ notifyServer: false, navigate: false });
+  const sameRoom = state.room?.roomId === roomId;
+  if (sameRoom && !forceRejoin) { activeView('room'); return; }
+  if (sameRoom) state.roomEpoch += 1;
+  else if (state.room || state.selectedTrack !== null || state.roomEpoch > 0) leaveRoom({ notifyServer: false, navigate: false });
   else state.roomEpoch += 1;
   const roomEpoch = state.roomEpoch;
   try { connectSocket(); } catch (e) { toast(e.message); return; }
@@ -102,8 +118,8 @@ function enterRoom(roomId) {
     if (response?.error) { if (sessionStorage.getItem(ACTIVE_ROOM_KEY) === roomId) sessionStorage.removeItem(ACTIVE_ROOM_KEY); const wasRestoring = document.documentElement.classList.contains('room-restoring'); document.documentElement.classList.remove('room-restoring'); $('#roomResumeNotice').classList.add('hidden'); if (wasRestoring) activeView('home'); toast(response.error); return; }
     sessionStorage.setItem(ACTIVE_ROOM_KEY, roomId);
     document.documentElement.classList.remove('room-restoring'); $('#roomResumeNotice').classList.add('hidden');
-    state.room = response.room; state.queue = response.room.queue || []; state.participants = uniqueParticipants(response.room.participants || []); state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.playbackNeedsGesture = false; $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; renderRoomFeatures();
-    $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); setAvatar($('#hostAvatar'), state.participants.find(person => person.userId === response.room.hostId)?.avatar || '', response.room.hostName || state.user.username); $('#roomVisibility').textContent = response.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
+    state.room = response.room; state.queue = response.room.queue || []; state.participants = uniqueParticipants(response.room.participants || []); state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.playbackNeedsGesture = false; if (!sameRoom) { $('#chatMessages').innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; } renderRoomFeatures();
+    $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); setAvatar($('#hostAvatar'), state.participants.find(person => person.userId === response.room.hostId)?.avatar || '', response.room.hostName || state.user.username); $('#roomVisibility').textContent = response.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; if (!forceRejoin) activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
     state.socket.off('room:queue').on('room:queue', update => { if (!state.room || update?.roomId !== state.room.roomId) return; const queue = update.queue || []; const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
     state.socket.off('room:participants').on('room:participants', update => { if (!state.room || update?.roomId !== state.room.roomId) return; state.participants = uniqueParticipants(update.participants || []); const host = state.participants.find(person => person.userId === state.room.hostId); if (host) setAvatar($('#hostAvatar'), host.avatar, host.username); renderParticipants(); renderRoomFeatures(); syncPeers(state.participants); });
     state.socket.off('room:playback').on('room:playback', playback => { if (playback?.roomId === state.room?.roomId) applyPlayback(playback); });
@@ -290,7 +306,7 @@ function renderNotifications() {
   $('#notificationList').innerHTML = state.notifications.length ? state.notifications.map(item => `<article class="activity-row ${item.read ? '' : 'unread'}"><div><b>${escapeHtml(item.title)}</b><span>${escapeHtml(item.message)} · ${new Date(item.createdAt).toLocaleString('tr-TR')}</span></div>${item.roomId ? `<button class="button button-outline" data-notification-room="${escapeHtml(item.roomId)}">Odaya git</button>` : ''}</article>`).join('') : '<p class="activity-empty">Yeni bildirimin yok.</p>';
   $$('[data-notification-room]').forEach(button => button.onclick = () => { hideModals(); enterRoom(button.dataset.notificationRoom); });
 }
-async function loadNotifications() { try { state.notifications = await api('/api/me/notifications'); renderNotifications(); } catch (error) { toast(error.message); } }
+async function loadNotifications() { try { const stored = await api('/api/me/notifications'); const merged = new Map(state.notifications.map(item => [item.id, item])); for (const item of stored) merged.set(item.id, item); state.notifications = [...merged.values()].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50); renderNotifications(); } catch (error) { toast(error.message); } }
 async function loadProfileActivity() {
   if (!state.user) return;
   try {
