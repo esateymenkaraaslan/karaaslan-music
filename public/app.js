@@ -173,7 +173,7 @@ async function openPublicProfile(username) {
   } catch (error) { toast(error.message); }
 }
 function renderPlaybackPermissions() {
-  ['#playBtn', '#prevBtn', '#nextBtn', '#shuffleBtn', '#repeatBtn', '#clearQueue', '#announceBtn'].forEach(selector => { const button = $(selector); if (button) { const localResume = selector === '#playBtn' && state.playbackNeedsGesture; button.disabled = !state.isDj && !localResume; button.title = localResume ? 'Bu cihazda dinlemeyi başlat' : state.isDj ? (button.dataset.djTitle || button.title) : 'Yalnızca oda sahibi veya DJ kullanabilir'; } });
+  ['#playBtn', '#prevBtn', '#nextBtn', '#shuffleBtn', '#repeatBtn', '#clearQueue', '#announceBtn'].forEach(selector => { const button = $(selector); if (button) { const localResume = selector === '#playBtn' && (state.playbackNeedsGesture || (!state.isDj && state.lastPlayback?.playing)); button.disabled = !state.isDj && !localResume; button.title = localResume ? 'Bu cihazda oda müziğini dinle; ortak oynatma kontrolü DJ’de kalır' : state.isDj ? (button.dataset.djTitle || button.title) : 'Ortak oynatma kontrolü yalnızca oda sahibi veya DJ’de'; } });
   $$('#queueList [data-play-index], #queueList [data-remove-track]').forEach(button => { button.disabled = !state.isDj; if (!state.isDj) button.title = 'Yalnızca oda sahibi veya DJ kullanabilir'; });
   $$('#searchResults [data-add-track]').forEach(button => { button.disabled = false; button.title = state.isDj ? 'Kuyruğa ekle' : 'DJ’ye şarkı isteği gönder'; });
   $$('.player-controls input[type="range"]').forEach(input => { if (input.id === 'seekBar') input.disabled = !state.isDj; });
@@ -277,7 +277,7 @@ function applyPendingYoutube() {
 function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
 function syncPlayback(playing = true) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position: playerPosition(), index: state.selectedTrack, track: state.queue[state.selectedTrack], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); $('#playBtn').textContent = playing ? 'Ⅱ' : '▶'; }
 function togglePlayback() {
-  if (state.playbackNeedsGesture) return resumeLocalPlayback();
+  if (state.playbackNeedsGesture || (!state.isDj && state.lastPlayback?.playing)) return resumeLocalPlayback();
   if (!state.isDj) {
     return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
   }
