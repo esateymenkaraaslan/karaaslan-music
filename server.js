@@ -426,7 +426,7 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const roomState = new Map();
 const roomPlaybackControlAt = new Map();
-const roomPlaybackQueues = new Map();
+const roomWriteQueues = new Map();
 const roomJoinQueues = new Map();
 const roomListenStatsAt = new Map();
 let roomsUpdateTimer;
@@ -446,16 +446,25 @@ function queueRoomJoin(roomId, work) {
   return current;
 }
 function queuePlaybackWrite(roomId, work) {
-  const previous = roomPlaybackQueues.get(roomId) || Promise.resolve();
+  return queueRoomWrite(roomId, work);
+}
+function queueRoomWrite(roomId, work) {
+  const previous = roomWriteQueues.get(roomId) || Promise.resolve();
   const current = previous.catch(() => {}).then(work);
-  roomPlaybackQueues.set(roomId, current);
-  current.finally(() => { if (roomPlaybackQueues.get(roomId) === current) roomPlaybackQueues.delete(roomId); }).catch(() => {});
+  roomWriteQueues.set(roomId, current);
+  current.finally(() => { if (roomWriteQueues.get(roomId) === current) roomWriteQueues.delete(roomId); }).catch(() => {});
   return current;
 }
+const roomMutationEvents = new Set(['room:queue:add', 'room:queue:remove', 'room:queue:replace', 'room:request:add', 'room:request:resolve', 'room:announcement', 'room:poll:create', 'room:poll:vote', 'room:poll:close']);
 function onAsyncSocket(socket, eventName, handler) {
   socket.on(eventName, (...args) => {
     const acknowledge = typeof args.at(-1) === 'function' ? args.at(-1) : null;
-    Promise.resolve().then(() => handler(...args)).catch(error => {
+    const roomId = socket.data.roomId;
+    const work = () => {
+      if (roomId && socket.data.roomId !== roomId) return acknowledge?.({ error: 'Oda bağlantısı değişti. İşlemi yeniden dene.' });
+      return handler(...args);
+    };
+    Promise.resolve().then(() => roomId && roomMutationEvents.has(eventName) ? queueRoomWrite(roomId, work) : work()).catch(error => {
       console.error(`Socket event ${eventName} failed:`, error.message);
       acknowledge?.({ error: 'İşlem tamamlanamadı. Bağlantını kontrol edip yeniden dene.' });
     });
@@ -584,7 +593,9 @@ io.on('connection', socket => {
     if (!item.title || (item.source === 'youtube' ? !item.videoId : !item.url)) return done({ error: 'Şarkı isteği geçersiz.' });
     const pending = (room.requests || []).filter(request => request.status === 'pending' && request.requesterId === socket.user.sub).length; if (pending >= 5) return done({ error: 'Aynı anda en fazla 5 bekleyen isteğin olabilir.' });
     const requests = [item, ...(room.requests || [])].slice(0, 50); await db.collection('rooms').updateOne({ roomId }, { $set: { requests } }); io.to(roomId).emit('room:requests', { roomId, requests });
-    await Promise.all([...new Set([room.hostId, ...(room.djIds || [])])].map(userId => notifyUser(userId, 'song-request', 'Yeni şarkı isteği', `${item.requester}: ${item.title}`, roomId))); done({ ok: true });
+    const recipients = [...new Set([room.hostId, ...(room.djIds || [])])];
+    Promise.all(recipients.map(userId => notifyUser(userId, 'song-request', 'Yeni şarkı isteği', `${item.requester}: ${item.title}`, roomId))).catch(error => console.error('Song request notifications failed:', error.message));
+    done({ ok: true });
   });
   onAsyncSocket(socket, 'room:request:resolve', async ({ requestId, accept } = {}, done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }) : null; const participant = roomState.get(roomId)?.get(socket.id);
@@ -593,22 +604,23 @@ io.on('connection', socket => {
     request.status = accept ? 'accepted' : 'rejected'; request.resolvedAt = new Date(); request.resolvedBy = socket.user.username;
     const update = { $set: { requests } }; let queue = room.queue || [];
     if (accept) { if (queue.length >= 100) return done({ error: 'Oda kuyruğu dolu.' }); queue = [...queue, { id: crypto.randomUUID(), title: request.title, artist: request.artist, source: request.source, videoId: request.videoId, url: request.url, addedBy: request.requester }]; update.$set.queue = queue; }
-    await db.collection('rooms').updateOne({ roomId }, update); io.to(roomId).emit('room:requests', { roomId, requests }); if (accept) io.to(roomId).emit('room:queue', { roomId, queue });
-    await notifyUser(request.requesterId, accept ? 'request-accepted' : 'request-rejected', accept ? 'İsteğin kabul edildi' : 'İsteğin reddedildi', request.title, roomId); done({ ok: true });
+    await db.collection('rooms').updateOne({ roomId }, update); io.to(roomId).emit('room:requests', { roomId, requests }); if (accept) { io.to(roomId).emit('room:queue', { roomId, queue }); scheduleRoomsUpdate(); }
+    notifyUser(request.requesterId, accept ? 'request-accepted' : 'request-rejected', accept ? 'İsteğin kabul edildi' : 'İsteğin reddedildi', request.title, roomId).catch(error => console.error('Song request notification failed:', error.message));
+    done({ ok: true });
   });
   onAsyncSocket(socket, 'room:announcement', async (text, done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }) : null; const participant = roomState.get(roomId)?.get(socket.id);
     if (!room || (!participant?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'Duyuruyu yalnızca oda sahibi veya DJ düzenleyebilir.' });
     const announcement = String(text || '').trim().slice(0, 180); await db.collection('rooms').updateOne({ roomId }, { $set: { announcement } }); io.to(roomId).emit('room:announcement', { roomId, announcement }); done({ ok: true });
   });
-  onAsyncSocket(socket, 'room:queue:replace', async queue => {
-    const roomId = socket.data.roomId; if (!roomId || !Array.isArray(queue) || queue.length > 100) return;
+  onAsyncSocket(socket, 'room:queue:replace', async (queue, done = () => {}) => {
+    const roomId = socket.data.roomId; if (!roomId || !Array.isArray(queue) || queue.length > 100) return done({ error: 'Kuyruk isteği geçersiz.' });
     const person = roomState.get(roomId)?.get(socket.id); const room = await db.collection('rooms').findOne({ roomId });
-    if (!person?.isDj && room?.hostId !== socket.user.sub) return;
+    if (!room || (!person?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'Kuyruğu yalnızca oda sahibi veya DJ temizleyebilir.' });
     const sanitized = queue.map(x => ({ id: String(x.id || crypto.randomUUID()).slice(0, 40), title: String(x.title || '').slice(0, 120), artist: String(x.artist || '').slice(0, 120), source: x.source === 'youtube' ? 'youtube' : 'library', videoId: String(x.videoId || '').slice(0, 32), url: String(x.url || '').slice(0, 500), addedBy: String(x.addedBy || '').slice(0, 24) })).filter(x => x.title && (x.source === 'youtube' ? x.videoId : x.url));
     const currentId = room?.playback?.track?.id; const index = currentId ? sanitized.findIndex(item => item.id === currentId) : -1;
     const playback = index < 0 ? { ...(room?.playback || {}), roomId, revision: (room?.playback?.revision || 0) + 1, playing: false, position: 0, index: null, track: null, updatedAt: new Date(), serverTime: Date.now() } : { ...room.playback, roomId, revision: (room.playback?.revision || 0) + 1, index, track: sanitized[index], updatedAt: new Date(), serverTime: Date.now() };
-    await db.collection('rooms').updateOne({ roomId }, { $set: { queue: sanitized, playback } }); io.to(roomId).emit('room:queue', { roomId, queue: sanitized }); io.to(roomId).emit('room:playback', playback); scheduleRoomsUpdate();
+    await db.collection('rooms').updateOne({ roomId }, { $set: { queue: sanitized, playback } }); io.to(roomId).emit('room:queue', { roomId, queue: sanitized }); io.to(roomId).emit('room:playback', playback); scheduleRoomsUpdate(); done({ ok: true, queue: sanitized });
   });
   onAsyncSocket(socket, 'room:queue:remove', async (trackId, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId) return done({ error: 'Önce odaya katıl.' });
