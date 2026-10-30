@@ -12,3 +12,42 @@
 .auth-brand,.auth-art-copy,.auth-art-foot{position:relative;z-index:1}.auth-vinyl{z-index:0;pointer-events:none}
 ::selection{background:#dcd0ff;color:#291f40}:focus-visible{outline:3px solid #ad98ff;outline-offset:2px}button:disabled{opacity:.52;cursor:not-allowed;transform:none}.room-favorite:focus-visible,.player-small:focus-visible{outline-color:var(--coral)}@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 .orbit-one{transform:rotate(-24deg)}.volume-button{font-size:12px}.dm-conversation{min-width:0;display:flex;flex-direction:column}.dm-title{border-bottom:1px solid var(--line);color:#5e566f;font:600 12px "Space Grotesk"}
+
+/* Responsive fixes: keep the room tools in reach and avoid narrow-screen overflow. */
+.room-layout{grid-template-columns:minmax(0,1fr) minmax(330px,360px);gap:26px;max-width:1480px;margin:0 auto}
+.room-main,.room-aside{min-width:0}
+.room-aside{top:18px;max-height:calc(100vh - 36px);overflow:auto;overscroll-behavior:contain}
+.search-box,.source-switch,.search-results{width:100%;min-width:0}
+.search-result{min-width:0}
+.search-result>div{flex:1;min-width:0;overflow:hidden}
+.search-result>div b,.search-result>div span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.search-result>button{flex:0 0 34px}
+.participant-profile-link{cursor:pointer}
+@media(max-width:1120px){.room-layout{grid-template-columns:minmax(0,1fr) 310px;gap:18px}}
+@media(max-width:820px){.room-layout{grid-template-columns:minmax(0,1fr);gap:14px;max-width:none}.room-aside{position:static;max-height:none;overflow:visible;order:1}.room-main{order:0}.room-head-actions{flex-wrap:wrap;justify-content:flex-end}.room-page-head{gap:10px}}
+@media(max-width:570px){
+  html,body{max-width:100%;overflow-x:hidden}
+  .room-layout{display:flex;flex-direction:column;gap:12px}
+  .room-main,.room-aside{width:100%}
+  .room-aside{order:0;padding:13px}
+  .room-main{order:1}
+  .room-page-head{position:static;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap}
+  .room-head-actions{flex:1;min-width:0;gap:5px}
+  .room-head-actions .button{white-space:nowrap}
+  .room-banner{width:100%;min-width:0}
+  .room-banner-info{min-width:0;overflow:hidden}
+  .room-banner-info h1{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .room-tabs{display:flex;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;white-space:nowrap;gap:5px;padding-bottom:4px}
+  .room-tabs::-webkit-scrollbar{display:none}
+  .room-tab{flex:0 0 auto;scroll-snap-align:start}
+  .player-panel,.player-controls{min-width:0}
+  .youtube-stage{width:100%;max-width:100%;height:clamp(180px,56vw,260px)}
+  .player-controls input[type=range]{touch-action:pan-x}
+  .search-box{display:flex;gap:7px}
+  .search-box input{min-width:0;flex:1}
+  .search-results{max-height:min(34vh,260px)}
+  .participant{min-width:0}
+  .participant>span:nth-child(2){min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .footer{gap:8px}
+  .sidebar{z-index:30}
+}

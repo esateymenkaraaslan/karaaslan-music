@@ -29,8 +29,10 @@ class RoomPlayer {
     this.onSocketPlayback = playback => this.receive(playback);
     this.onAudioEnded = () => this.onEnded?.();
     this.onPlayerReady = () => { this.playerReady = true; this.applyPending(); };
+    this.autoplayTimer = null;
     this.onPlayerState = event => {
       if (window.YT && event.data === window.YT.PlayerState.ENDED) this.onEnded?.();
+      if (window.YT && event.data === window.YT.PlayerState.PLAYING) { clearTimeout(this.autoplayTimer); this.clearGesture(); }
     };
     this.onPlayerError = () => this.onError?.('Bu YouTube parçası oynatılamıyor.');
     this.audio = document.querySelector('#localAudio');
@@ -239,6 +241,10 @@ class RoomPlayer {
       }
       this.applyVolume();
       this.syncPlayButton(playback.playing);
+      clearTimeout(this.autoplayTimer);
+      if (playback.playing && matchMedia('(max-width: 820px)').matches) this.autoplayTimer = setTimeout(() => {
+        if (generation === this.generation && this.snapshot?.playing && this.player?.getPlayerState?.() !== window.YT?.PlayerState?.PLAYING) this.requireGesture();
+      }, 4500);
     } catch { this.onError?.('YouTube oynatımı başlatılamadı.'); }
   }
 
@@ -337,6 +343,7 @@ class RoomPlayer {
 
   clear() {
     this.generation++;
+    clearTimeout(this.autoplayTimer);
     this.snapshot = null;
     this.pending = null;
     this.loadedTrackId = null;

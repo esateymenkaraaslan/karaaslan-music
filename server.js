@@ -583,7 +583,7 @@ io.on('connection', socket => {
     if (!room || (!person?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return done({ error: 'Kuyruğa yalnızca oda sahibi veya DJ şarkı ekleyebilir.' });
     const item = { id: crypto.randomUUID(), title: String(track?.title || '').slice(0, 120), artist: String(track?.artist || '').slice(0, 120), source: track?.source === 'youtube' ? 'youtube' : 'library', videoId: String(track?.videoId || '').slice(0, 32), url: String(track?.url || '').slice(0, 500), addedBy: person.username };
     if (!item.title || (item.source === 'youtube' && !item.videoId) || (item.source === 'library' && !item.url)) return done({ error: 'Şarkı bilgisi geçersiz.' });
-    const queue = room.queue || []; if (queue.length >= 100) return done({ error: 'Oda kuyruğu dolu.' }); queue.push(item); await db.collection('rooms').updateOne({ roomId }, { $set: { queue } }); io.to(roomId).emit('room:queue', { roomId, queue }); scheduleRoomsUpdate(); done({ ok: true });
+    const queue = room.queue || []; if (queue.length >= 100) return done({ error: 'Oda kuyruğu dolu.' }); queue.push(item); await db.collection('rooms').updateOne({ roomId }, { $set: { queue } }); io.to(roomId).emit('room:queue', { roomId, queue }); scheduleRoomsUpdate(); done({ ok: true, queue });
   });
   onAsyncSocket(socket, 'room:request:add', async (track, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId) return done({ error: 'Önce bir odaya katıl.' });
