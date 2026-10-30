@@ -3,7 +3,41 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const savedToken = localStorage.getItem('km_token') || sessionStorage.getItem('km_token') || '';
 if (savedToken && !localStorage.getItem('km_token') && sessionStorage.getItem('km_remember') !== '0') localStorage.setItem('km_token', savedToken);
 const ACTIVE_ROOM_KEY = 'km_active_room';
-const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], friends: { friends: [], incoming: [], outgoing: [] }, communityMembers: [], communityTotal: 0, communityPage: 0, communityPages: 1, communityMessages: [], dmMessages: [], activeDmFriend: null, communityTab: 'members', chatMessages: [], playlistRequest: 0, roomRefreshRequest: 0, room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, youtube: null, ytReady: false, ytPlayerReady: false, pendingYoutube: null, pendingPlayback: null, loadingTrackId: null, mediaLoadSeq: 0, ytLoaded: false, localTrack: null, isDj: false, isHost: false, syncLeaderId: null, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, queueLocked: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, localMusicMuted: localStorage.getItem('km_music_muted') === '1', toastTimer: null };
+const state = { token: savedToken, user: null, myRooms: [], notifications: [], playlists: [], friends: { friends: [], incoming: [], outgoing: [] }, communityMembers: [], communityTotal: 0, communityPage: 0, communityPages: 1, communityMessages: [], dmMessages: [], activeDmFriend: null, communityTab: 'members', chatMessages: [], playlistRequest: 0, roomRefreshRequest: 0, room: null, roomEpoch: 0, socket: null, socketConfigured: false, socketConnectedBefore: false, source: 'youtube', queue: [], participants: [], catalogSearchRequest: 0, currentTab: 'queue', voiceStream: null, cameraStream: null, peers: new Map(), remoteStreams: new Map(), voiceOn: false, cameraOn: false, playbackNeedsGesture: false, lastPlayback: null, selectedTrack: null, repeat: 'off', shuffle: false, localMusicMuted: localStorage.getItem('km_music_muted') === '1', toastTimer: null };
+const roomPlayer = new RoomPlayer({
+  getRoom: () => state.room,
+  getQueue: () => state.queue,
+  getIndex: () => state.selectedTrack,
+  getRepeat: () => state.repeat,
+  getShuffle: () => state.shuffle,
+  canControl: () => state.isDj,
+  onSnapshot: playback => {
+    state.lastPlayback = playback;
+    state.repeat = playback.repeat || 'off';
+    state.shuffle = !!playback.shuffle;
+    const track = playback.track;
+    if (track) {
+      let index = state.queue.findIndex(item => item.id === track.id);
+      if (index < 0 && Number.isInteger(playback.index)) { index = Math.min(playback.index, state.queue.length); state.queue.splice(index, 0, track); }
+      state.selectedTrack = index < 0 ? null : index;
+      $('#nowTitle').textContent = track.title || 'Şarkı';
+      $('#nowArtist').textContent = track.artist || '';
+    } else {
+      state.selectedTrack = null;
+    }
+    updateRepeatButton();
+    $('#shuffleBtn').classList.toggle('active', state.shuffle);
+    renderQueue();
+  },
+  onGesture: required => {
+    state.playbackNeedsGesture = required;
+    $('#playbackGestureNotice')?.classList.toggle('hidden', !required);
+    renderPlaybackPermissions();
+    if (required) toast('Tarayıcı otomatik oynatmayı durdurdu. Bu cihazda dinlemek için düğmeye dokun.');
+  },
+  onError: message => toast(message),
+  onEnded: () => nextTrack()
+});
 const api = async (url, options = {}) => {
   const headers = { ...(options.body && !(options.body instanceof Blob) && !(options.body instanceof ArrayBuffer) ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...(options.headers || {}) };
   const response = await fetch(url, { ...options, headers });
@@ -80,6 +114,7 @@ function requireUser(action) { if (!state.user) { modalAuth('login'); return fal
 function connectSocket() {
   if (!state.token) throw new Error('Odaya katılmak için önce giriş yap.');
   if (!state.socket) { state.socket = io({ auth: { token: state.token } }); state.socketConfigured = false; state.socket.on('connect_error', err => { if (state.token) toast(err.message || 'Canlı bağlantı kurulamadı.'); }); state.socket.on('auth:revoked', () => { leaveRoom(); state.socket?.disconnect(); state.socket = null; state.socketConfigured = false; state.token = ''; state.user = null; localStorage.removeItem('km_token'); sessionStorage.removeItem('km_token'); sessionStorage.removeItem('km_remember'); setAuthHeader(); toast('Hesap oturumu sona erdi. Yeniden giriş yap.'); }); }
+  roomPlayer.bind(state.socket);
   if (!state.socketConfigured) {
     state.socket.on('rooms:update', rooms => Array.isArray(rooms) ? applyRoomsSnapshot(rooms) : scheduleRoomsRefresh());
     state.socket.on('catalog:update', () => {
@@ -139,12 +174,10 @@ function enterRoom(roomId, { forceRejoin = false } = {}) {
     if (response?.error) { if (sessionStorage.getItem(ACTIVE_ROOM_KEY) === roomId) sessionStorage.removeItem(ACTIVE_ROOM_KEY); const wasRestoring = document.documentElement.classList.contains('room-restoring'); document.documentElement.classList.remove('room-restoring'); $('#roomResumeNotice').classList.add('hidden'); if (wasRestoring) activeView('home'); toast(response.error); return; }
     sessionStorage.setItem(ACTIVE_ROOM_KEY, roomId);
     document.documentElement.classList.remove('room-restoring'); $('#roomResumeNotice').classList.add('hidden');
-    state.room = response.room; state.queue = response.room.queue || []; state.participants = uniqueParticipants(response.room.participants || []); state.chatMessages = response.room.chat || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.queueLocked = false; state.lastPlayback = response.room.playback || null; state.syncLeaderId = response.room.playbackControllerId || response.room.playback?.controllerId || null; state.playbackNeedsGesture = false; if (!sameRoom) { $('#chatMessages').innerHTML = ''; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; } renderChat(); renderPoll(); if (!sameRoom) { $('#pollComposer')?.classList.add('hidden'); $('#pollCreateForm')?.reset(); } renderRoomFeatures();
+    state.room = response.room; state.queue = response.room.queue || []; state.participants = uniqueParticipants(response.room.participants || []); state.chatMessages = response.room.chat || []; state.isHost = response.room.hostId === state.user.id; state.isDj = state.isHost || !!state.user.isAdmin || !!state.participants.find(person => person.id === state.socket.id)?.isDj; state.playbackNeedsGesture = false; roomPlayer.enter(response.room); if (!sameRoom) { $('#chatMessages').innerHTML = ''; $('#chatBadge').textContent = '0'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; } renderChat(); renderPoll(); if (!sameRoom) { $('#pollComposer')?.classList.add('hidden'); $('#pollCreateForm')?.reset(); } renderRoomFeatures();
     $('#roomTitle').textContent = response.room.name || 'Arkadaşlarla dinleme'; $('#hostName').textContent = response.room.hostName || (state.isHost ? state.user.username : 'Oda sahibi'); setAvatar($('#hostAvatar'), state.participants.find(person => person.userId === response.room.hostId)?.avatar || '', response.room.hostName || state.user.username); $('#roomVisibility').textContent = response.room.visibility === 'private' ? 'Özel oda · davetli' : 'Herkese açık'; $('#roomCode').textContent = roomId; $('#participantList').dataset.owner = response.room.hostId; $('#queueCount').textContent = state.queue.length; $('#queueSubCount').textContent = `${state.queue.length} parça`; if (!forceRejoin) activeView('room'); renderQueue(); renderParticipants(); refreshRooms();
     state.socket.off('room:queue').on('room:queue', update => { if (!state.room || update?.roomId !== state.room.roomId) return; const queue = update.queue || []; const currentId = state.queue[state.selectedTrack]?.id; state.queue = queue; state.selectedTrack = currentId ? queue.findIndex(t => t.id === currentId) : null; if (state.selectedTrack < 0) state.selectedTrack = null; renderQueue(); });
     state.socket.off('room:participants').on('room:participants', update => { if (!state.room || update?.roomId !== state.room.roomId) return; state.participants = uniqueParticipants(update.participants || []); const host = state.participants.find(person => person.userId === state.room.hostId); if (host) setAvatar($('#hostAvatar'), host.avatar, host.username); renderParticipants(); renderRoomFeatures(); syncPeers(state.participants); });
-    state.socket.off('room:playback').on('room:playback', playback => { if (playback?.roomId === state.room?.roomId) applyPlayback(playback); });
-    state.socket.off('room:sync:leader').on('room:sync:leader', update => { if (update?.roomId !== state.room?.roomId) return; state.syncLeaderId = update.controllerId || null; if (state.lastPlayback) state.lastPlayback.controllerId = state.syncLeaderId; });
     state.socket.off('room:history').on('room:history', event => { if (event?.roomId !== state.room?.roomId) return; state.room.history = [event.entry, ...(state.room.history || [])].slice(0, 30); renderRoomFeatures(); });
     state.socket.off('room:stats').on('room:stats', event => { if (event?.roomId !== state.room?.roomId) return; state.room.statistics = event.statistics; renderRoomFeatures(); });
     state.socket.off('room:requests').on('room:requests', event => { if (event?.roomId !== state.room?.roomId) return; state.room.requests = event.requests || []; renderRoomFeatures(); });
@@ -160,8 +193,7 @@ function enterRoom(roomId, { forceRejoin = false } = {}) {
     state.socket.off('rtc:signal').on('rtc:signal', message => onSignal(message));
     state.socket.off('disconnect').on('disconnect', () => { if (state.room) toast('Bağlantı koptu, yeniden bağlanılıyor…'); });
     $('#deleteRoom').classList.toggle('hidden', !state.isHost && !state.user?.isAdmin);
-    state.repeat = response.room.playback?.repeat || 'off'; state.shuffle = !!response.room.playback?.shuffle; state.lastPlaybackRevision = response.room.playback?.revision || 0; updateRepeatButton(); $('#shuffleBtn').classList.toggle('active', state.shuffle); renderPlaybackPermissions(); state.selectedTrack = null;
-    if (response.room.playback?.track && Number.isInteger(response.room.playback.index)) { state.selectedTrack = response.room.playback.index; loadTrackMedia(response.room.playback.track, response.room.playback.position || 0, response.room.playback.playing, response.room.playback.serverTime); }
+    state.repeat = response.room.playback?.repeat || 'off'; state.shuffle = !!response.room.playback?.shuffle; updateRepeatButton(); $('#shuffleBtn').classList.toggle('active', state.shuffle); renderPlaybackPermissions();
   });
 }
 function uniqueParticipants(participants) { return [...new Map(participants.map(person => [person.userId || person.id, person])).values()]; }
@@ -230,156 +262,22 @@ async function searchTracks() {
   } catch (e) { if (requestId === state.catalogSearchRequest) $('#searchResults').innerHTML = `<div class="search-hint">${escapeHtml(e.message)}</div>`; }
 }
 function parseYouTube(value) { try { const u = new URL(value); const host = u.hostname.replace(/^www\./, '').toLowerCase(); if (!['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(host)) return ''; let id = host === 'youtu.be' ? u.pathname.slice(1) : u.searchParams.get('v'); if (host !== 'youtu.be' && u.pathname.startsWith('/embed/')) id = u.pathname.split('/')[2]; return /^[A-Za-z0-9_-]{11}$/.test(id || '') ? id : ''; } catch { return ''; } }
-let youtubeApiPromise = null;
-async function ytSearchId(videoId) {
-  if (window.YT?.Player) { state.ytReady = true; return videoId; }
-  if (!youtubeApiPromise) youtubeApiPromise = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('YouTube oynatıcı yüklenemedi. Bağlantını kontrol edip yeniden dene.')), 10_000);
-    window.onYouTubeIframeAPIReady = () => { state.ytReady = true; clearTimeout(timeout); resolve(); };
-    let script = document.getElementById('youtube-iframe-api');
-    if (!script) { script = document.createElement('script'); script.id = 'youtube-iframe-api'; script.src = 'https://www.youtube.com/iframe_api'; script.onerror = () => { clearTimeout(timeout); reject(new Error('YouTube oynatıcı yüklenemedi.')); }; document.head.append(script); }
-  });
-  try { await youtubeApiPromise; } catch (error) { youtubeApiPromise = null; throw error; }
-  if (!window.YT?.Player) throw new Error('YouTube oynatıcı hazır değil. Biraz sonra yeniden dene.');
-  return videoId;
-}
-function playAt(index) {
-  if (!state.isDj) return toast('Yalnızca oda sahibi veya DJ müziği yönetebilir.');
-  if (index < 0 || index >= state.queue.length) return;
-  syncPlayback(true, 0, index);
-}
-function requirePlaybackGesture() {
-  state.playbackNeedsGesture = true;
-  $('#playBtn').textContent = '▶';
-  renderPlaybackPermissions();
-  $('#playbackGestureNotice')?.classList.remove('hidden');
-  toast('Tarayıcı bu cihazda otomatik oynatmayı durdurdu. Dinlemek için düğmeye dokun.');
-}
-function clearPlaybackGesture() {
-  state.playbackNeedsGesture = false;
-  $('#playbackGestureNotice')?.classList.add('hidden');
-  renderPlaybackPermissions();
-}
-function waitForAudioMetadata(audio) {
-  if (audio.readyState >= 1) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => finish(new Error('Ses dosyasının bilgileri zamanında yüklenemedi.')), 10_000);
-    const finish = error => { clearTimeout(timer); audio.removeEventListener('loadedmetadata', onReady); audio.removeEventListener('error', onError); error ? reject(error) : resolve(); };
-    const onReady = () => finish(); const onError = () => finish(new Error('Ses dosyası bu cihazda yüklenemedi.'));
-    audio.addEventListener('loadedmetadata', onReady, { once: true }); audio.addEventListener('error', onError, { once: true });
-  });
-}
-function playbackFromServerPosition(position, serverTime, playing) { return Math.max(0, Number(position) || 0) + (playing ? Math.max(0, (Date.now() - (Number(serverTime) || Date.now())) / 1000) : 0); }
-function useLatestPendingPlayback(item, position, shouldPlay, serverTime) {
-  const latest = state.pendingPlayback;
-  if (latest?.track?.id === item.id) { position = latest.position; shouldPlay = !!latest.playing; serverTime = latest.serverTime; state.pendingPlayback = null; }
-  return { position, shouldPlay, serverTime, target: playbackFromServerPosition(position, serverTime, shouldPlay) };
-}
-async function loadTrackMedia(item, position = 0, shouldPlay = true, serverTime = Date.now()) {
-  const epoch = state.roomEpoch; const roomId = state.room?.roomId; const loadSeq = ++state.mediaLoadSeq;
-  state.loadingTrackId = item.id; state.activeTrackId = item.id;
-  applyLocalMusicVolume();
-  $('#playerPlaceholder').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#nowTitle').textContent = item.title || 'Şarkı'; $('#nowArtist').textContent = item.artist || '';
-  if (item.source === 'youtube') {
-    $('#ytPlayer').classList.remove('hidden');
-    try { await ytSearchId(item.videoId); } catch (error) { if (loadSeq === state.mediaLoadSeq) state.loadingTrackId = null; toast(error.message); return false; }
-    if (epoch !== state.roomEpoch || roomId !== state.room?.roomId || loadSeq !== state.mediaLoadSeq) return false;
-    ({ position, shouldPlay, serverTime } = useLatestPendingPlayback(item, position, shouldPlay, serverTime));
-    state.pendingYoutube = { epoch, roomId, trackId: item.id, videoId: item.videoId, position, serverTime, playing: !!shouldPlay };
-    try {
-      if (!state.youtube) state.youtube = new YT.Player('ytPlayer', { height: '240', width: '100%', videoId: item.videoId, playerVars: { playsinline: 1, origin: location.origin, controls: 0, disablekb: 1, rel: 0 }, events: { onReady: () => { state.ytPlayerReady = true; applyPendingYoutube(); }, onStateChange: e => { if (e.data === YT.PlayerState.ENDED && state.activeTrackId === state.queue[state.selectedTrack]?.id) nextTrack(); }, onError: () => toast('Bu YouTube videosu oynatılamıyor.'), onAutoplayBlocked: requirePlaybackGesture } });
-      else if (state.ytPlayerReady) { applyPendingYoutube(); if (state.loadingTrackId === item.id) state.loadingTrackId = null; }
-    } catch (error) { if (loadSeq === state.mediaLoadSeq) state.loadingTrackId = null; toast(`YouTube oynatıcı başlatılamadı: ${error.message}`); return false; }
-  } else {
-    if (epoch !== state.roomEpoch || roomId !== state.room?.roomId || loadSeq !== state.mediaLoadSeq) return false;
-    state.pendingYoutube = null; state.youtube?.stopVideo?.(); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.remove('hidden'); $('#localNowTitle').textContent = item.title; $('#localNowArtist').textContent = item.artist || ''; const audio = $('#localAudio'); if (audio.src !== new URL(item.url, location.href).href) { audio.src = item.url; try { await waitForAudioMetadata(audio); } catch (error) { if (loadSeq === state.mediaLoadSeq) state.loadingTrackId = null; toast(error.message); return false; } }
-    if (epoch !== state.roomEpoch || roomId !== state.room?.roomId || loadSeq !== state.mediaLoadSeq) return false;
-    ({ position, shouldPlay, serverTime } = useLatestPendingPlayback(item, position, shouldPlay, serverTime)); audio.currentTime = playbackFromServerPosition(position, serverTime, shouldPlay);
-    if (shouldPlay) await audio.play().then(clearPlaybackGesture).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); }); else audio.pause();
-    if (loadSeq === state.mediaLoadSeq && state.loadingTrackId === item.id) state.loadingTrackId = null;
-  }
-  $('#playBtn').textContent = shouldPlay ? 'Ⅱ' : '▶';
-  return true;
-}
-function applyPendingYoutube() {
-  const pending = state.pendingYoutube;
-  if (!pending || pending.epoch !== state.roomEpoch || pending.roomId !== state.room?.roomId || pending.trackId !== state.activeTrackId || !state.youtube) return;
-  applyLocalMusicVolume();
-  const latest = useLatestPendingPlayback({ id: pending.trackId }, pending.position, pending.playing, pending.serverTime);
-  pending.playing = latest.shouldPlay;
-  const position = latest.target;
-  if (pending.playing) state.youtube.loadVideoById(pending.videoId, position);
-  else state.youtube.cueVideoById(pending.videoId, position);
-  if (state.loadingTrackId === pending.trackId) state.loadingTrackId = null;
-  state.pendingYoutube = null;
-}
-function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
-function syncPlayback(playing = true, position = playerPosition(), index = state.selectedTrack) { if (!state.socket || !state.room || !state.isDj) return; const roomId = state.room.roomId; state.socket.emit('room:playback', { roomId, playing, position, index, track: state.queue[index], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); else if (result?.playback && state.room?.roomId === roomId) applyPlayback(result.playback, true); }); }
+function playAt(index) { roomPlayer.play(index); }
+function playerPosition() { return roomPlayer.position(); }
+function syncPlayback(playing = true, position = playerPosition(), index = state.selectedTrack) { roomPlayer.command({ playing, position, index }); }
 function togglePlayback() {
-  if (state.playbackNeedsGesture || (!state.isDj && state.lastPlayback?.playing)) return resumeLocalPlayback();
-  if (!state.isDj) {
-    return toast('Oynatmayı oda DJ’i yönetiyor. Ses düzeyini kendin ayarlayabilirsin.');
-  }
+  if (state.playbackNeedsGesture || (!state.isDj && state.lastPlayback?.playing)) return roomPlayer.resumeLocal();
+  if (!state.isDj) return toast('Oynatmayı oda DJ’i yönetiyor.');
   if (state.selectedTrack == null) return state.queue.length ? playAt(0) : toast('Önce kuyruğa bir şarkı ekle.');
-  const track = state.queue[state.selectedTrack]; if (!track) { clearPlaybackSurface(); return toast('Bu odanın kuyruğu boş.'); }
-  const currentlyPlaying = track.source === 'youtube' && (state.pendingYoutube?.trackId === track.id ? state.pendingYoutube.playing : !!state.youtube && !!window.YT && state.youtube.getPlayerState?.() === window.YT.PlayerState.PLAYING);
-  const playing = track.source === 'youtube' ? !currentlyPlaying : $('#localAudio').paused;
-  syncPlayback(playing);
+  roomPlayer.toggle();
 }
-function resumeLocalPlayback() {
-  const track = state.queue[state.selectedTrack]; if (!track) return;
-  const playback = state.lastPlayback || {};
-  const target = Math.max(0, Number(playback.position) || 0) + (playback.playing ? Math.max(0, (Date.now() - (playback.serverTime || Date.now())) / 1000) : 0);
-  if (track.source === 'youtube') {
-    if (state.pendingYoutube?.trackId === track.id && !state.ytPlayerReady) state.pendingYoutube.playing = true;
-    else if (state.youtube) { state.youtube.seekTo(target, true); state.youtube.playVideo(); }
-    else return toast('YouTube oynatıcı hazırlanıyor; birkaç saniye sonra tekrar dokun.');
-    clearPlaybackGesture(); $('#playBtn').textContent = 'Ⅱ';
-  } else {
-    const audio = $('#localAudio'); audio.currentTime = target;
-    audio.play().then(() => { clearPlaybackGesture(); $('#playBtn').textContent = 'Ⅱ'; }).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); });
-  }
-}
-function applyPlayback(playback, force = false) {
-  if (!playback || (playback.roomId && playback.roomId !== state.room?.roomId)) return;
-  if (!force && Number.isInteger(playback.revision) && playback.revision <= (state.lastPlaybackRevision || 0)) return;
-  const previousTrackId = state.queue[state.selectedTrack]?.id || state.activeTrackId;
-  const previousRepeat = state.repeat; const previousShuffle = state.shuffle;
-  state.lastPlayback = playback;
-  state.syncLeaderId = playback.controllerId || state.syncLeaderId;
-  if (!playback.playing) clearPlaybackGesture();
-  if (Number.isInteger(playback.revision)) state.lastPlaybackRevision = playback.revision;
-  if (!playback.track && playback.index == null) { state.mediaLoadSeq += 1; state.loadingTrackId = null; state.pendingPlayback = null; state.selectedTrack = null; state.activeTrackId = null; state.pendingYoutube = null; $('#localAudio').pause(); state.youtube?.stopVideo?.(); $('#playerPlaceholder').classList.remove('hidden'); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#playBtn').textContent = '▶'; $('#nowTitle').textContent = 'Henüz şarkı seçilmedi'; $('#nowArtist').textContent = 'Sıradan bir parça seçerek başlayın'; return; }
-  const track = playback.track || state.queue[playback.index ?? state.selectedTrack]; if (!track) return;
-  state.repeat = playback.repeat || state.repeat; state.shuffle = !!playback.shuffle; updateRepeatButton(); $('#shuffleBtn').classList.toggle('active', state.shuffle);
-  const index = state.queue.findIndex(t => t.id === track.id); state.selectedTrack = index >= 0 ? index : (Number.isInteger(playback.index) ? playback.index : 0);
-  if (!state.queue[state.selectedTrack] || state.queue[state.selectedTrack].id !== track.id) state.queue[state.selectedTrack] = track;
-  const target = Math.max(0, Number(playback.position) || 0) + (playback.playing ? Math.max(0, (Date.now() - (playback.serverTime || Date.now())) / 1000) : 0);
-  const current = state.queue[state.selectedTrack];
-  if (state.loadingTrackId === current.id) { state.pendingPlayback = playback; $('#playBtn').textContent = playback.playing ? 'Ⅱ' : '▶'; renderQueue(); return; }
-  const mediaMismatch = current.source === 'youtube' ? !state.youtube || state.activeTrackId !== current.id : $('#localAudio').src !== new URL(current.url || '/', location.href).href;
-  if (mediaMismatch) { loadTrackMedia(current, playback.position || 0, !!playback.playing, playback.serverTime); return; }
-  if (current.source === 'youtube' && state.youtube && state.ytPlayerReady) { if (Math.abs((state.youtube.getCurrentTime?.() || 0) - target) > 0.75) state.youtube.seekTo(target, true); playback.playing ? state.youtube.playVideo() : state.youtube.pauseVideo(); }
-  else if (current.source === 'library') { const audio = $('#localAudio'); if (Math.abs(audio.currentTime - target) > 0.75) audio.currentTime = target; playback.playing ? audio.play().then(clearPlaybackGesture).catch(error => { if (error.name === 'NotAllowedError') requirePlaybackGesture(); else toast('Şarkı bu cihazda oynatılamadı.'); }) : audio.pause(); }
-  $('#playBtn').textContent = playback.playing ? 'Ⅱ' : '▶';
-  if (previousTrackId !== current.id || previousRepeat !== state.repeat || previousShuffle !== state.shuffle) renderQueue(); else renderPlaybackPermissions();
-}
-function correctPlaybackDrift() {
-  const playback = state.lastPlayback; const track = state.queue[state.selectedTrack];
-  if (!playback?.playing || !track || track.id !== playback.track?.id || state.loadingTrackId === track.id) return;
-  const target = playbackFromServerPosition(playback.position, playback.serverTime, true);
-  if (track.source === 'youtube' && state.youtube && state.ytPlayerReady && state.youtube.getPlayerState?.() === window.YT?.PlayerState?.PLAYING) {
-    if (Math.abs((state.youtube.getCurrentTime?.() || 0) - target) > 1.1) state.youtube.seekTo(target, true);
-  } else if (track.source === 'library') {
-    const audio = $('#localAudio');
-    if (!audio.paused && audio.readyState >= 1 && Math.abs(audio.currentTime - target) > 1.1) audio.currentTime = target;
-  }
-}
+function resumeLocalPlayback() { roomPlayer.resumeLocal(); }
+function applyPlayback(playback, force = false) { roomPlayer.receive(playback, force); }
 function updateRepeatButton() { const button = $('#repeatBtn'); if (!button) return; button.dataset.mode = state.repeat; button.title = `Tekrar: ${{ off: 'Kapalı', all: 'Tüm sıra', one: 'Tek şarkı' }[state.repeat]}`; button.classList.toggle('active', state.repeat !== 'off'); }
 function nextTrack(manual = false) { if (!state.queue.length || !state.isDj) return; if (!manual && state.repeat === 'one') return playAt(state.selectedTrack ?? 0); if (!manual && state.repeat === 'off' && state.selectedTrack === state.queue.length - 1) { syncPlayback(false); return; } let next = ((state.selectedTrack ?? -1) + 1) % state.queue.length; if (state.shuffle && state.queue.length > 1) { const choices = state.queue.map((_, i) => i).filter(i => i !== state.selectedTrack); next = choices[Math.floor(Math.random() * choices.length)]; } playAt(next); }
 function prevTrack() { if (!state.isDj) return; if (playerPosition() > 3) { syncPlayback(true, 0); return; } if (state.queue.length) playAt((state.selectedTrack - 1 + state.queue.length) % state.queue.length); }
 function appendChat(msg) { if (!msg?.id || state.chatMessages.some(item => item.id === msg.id)) return; state.chatMessages.push(msg); state.chatMessages = state.chatMessages.slice(-100); renderChat(); $('#chatBadge').textContent = Number($('#chatBadge').textContent || 0) + 1; }
-function applyLocalMusicVolume() { const volume = state.localMusicMuted ? 0 : Number($('#volumeRange')?.value || 75) / 100; const audio = $('#localAudio'); if (audio) audio.volume = volume; state.youtube?.setVolume?.(volume * 100); const button = $('#roomListenToggle'); if (button) { button.textContent = state.localMusicMuted ? '🎧 Müzik sessiz' : '🎧 Müziği dinle'; button.setAttribute('aria-pressed', String(state.localMusicMuted)); button.title = state.localMusicMuted ? 'Oda müziğinin sesini bu cihazda aç' : 'Oda müziğini bu cihazda sessize al'; } }
+function applyLocalMusicVolume() { roomPlayer.applyVolume(); const button = $('#roomListenToggle'); if (button) { button.textContent = state.localMusicMuted ? '🎧 Müzik sessiz' : '🎧 Müziği dinle'; button.setAttribute('aria-pressed', String(state.localMusicMuted)); button.title = state.localMusicMuted ? 'Oda müziğinin sesini bu cihazda aç' : 'Oda müziğini bu cihazda sessize al'; } }
 function renderChat() {
   const box = $('#chatMessages'); if (!box) return;
   if (!state.chatMessages.length) { box.innerHTML = '<div class="chat-welcome">Odaya hoş geldin. Sohbeti başlat!</div>'; return; }
@@ -631,10 +529,8 @@ async function toggleCamera() {
   } catch (e) { toast(mediaErrorMessage(e, 'Kamera')); }
 }
 function clearPlaybackSurface() {
-  state.mediaLoadSeq += 1; state.loadingTrackId = null; state.pendingPlayback = null; state.selectedTrack = null; state.activeTrackId = null; state.pendingYoutube = null; state.localTrack = null; state.queueLocked = false; state.lastPlayback = null; state.playbackNeedsGesture = false;
-  $('#localAudio').pause(); $('#localAudio').removeAttribute('src'); $('#localAudio').load(); state.youtube?.stopVideo?.();
-  $('#playerPlaceholder').classList.remove('hidden'); $('#ytPlayer').classList.add('hidden'); $('#localStage').classList.add('hidden');
-  $('#nowTitle').textContent = 'Henüz şarkı seçilmedi'; $('#nowArtist').textContent = 'Sıradan bir parça seçerek başlayın'; $('#playBtn').textContent = '▶';
+  state.selectedTrack = null; state.lastPlayback = null; state.playbackNeedsGesture = false;
+  roomPlayer.leave();
   state.repeat = 'off'; state.shuffle = false; updateRepeatButton(); $('#shuffleBtn').classList.remove('active');
 }
 function leaveRoom({ notifyServer = true, navigate = true } = {}) {
@@ -647,7 +543,7 @@ function leaveRoom({ notifyServer = true, navigate = true } = {}) {
   $('#localVideo').srcObject = null; $('#localVideoTile').classList.remove('has-video'); $('#micToggle').textContent = 'Mikrofonu aç'; $('#cameraToggle').textContent = 'Kamerayı aç';
   state.voiceStream = null; state.cameraStream = null; state.voiceOn = false; state.cameraOn = false;
   if (notifyServer && state.socket && state.room) state.socket.emit('room:leave');
-  state.room = null; state.isHost = false; state.isDj = false; state.queue = []; state.participants = []; state.lastPlaybackRevision = 0; clearPlaybackSurface();
+  state.room = null; state.isHost = false; state.isDj = false; state.queue = []; state.participants = []; clearPlaybackSurface();
   if (navigate) activeView('home'); refreshRooms();
 }
 
@@ -678,33 +574,21 @@ $('#chatForm').onsubmit = e => { e.preventDefault(); const text = $('#chatInput'
 $$('.source-option').forEach(button => button.onclick = () => { state.source = button.dataset.source; $$('.source-option').forEach(b => b.classList.toggle('active', b === button)); $('#trackSearch').placeholder = state.source === 'youtube' ? 'Şarkı veya sanatçı...' : 'Katalogda ara...'; $('#searchResults').innerHTML = '<div class="search-hint">Şarkı adını yazıp sonuçları ara.</div>'; });
 $('#searchBtn').onclick = searchTracks; $('#trackSearch').onkeydown = e => { if (e.key === 'Enter') searchTracks(); };
 $('#pasteLink').onclick = () => { const value = prompt('YouTube şarkı veya video bağlantısını yapıştır:'); if (!value) return; const id = parseYouTube(value); if (!id) return toast('Geçerli bir YouTube bağlantısı değil.'); const title = prompt('Şarkı adı (isteğe bağlı):') || 'YouTube parçası'; addTrack({ title, artist: 'YouTube', source: 'youtube', videoId: id }); };
-$('#playBtn').onclick = togglePlayback; $('#nextBtn').onclick = () => nextTrack(true); $('#prevBtn').onclick = prevTrack; $('#shuffleBtn').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.shuffle = !state.shuffle; $('#shuffleBtn').classList.toggle('active', state.shuffle); syncPlayback(!!(state.queue[state.selectedTrack] && (state.queue[state.selectedTrack].source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused))); toast(state.shuffle ? 'Karıştırma açıldı.' : 'Karıştırma kapatıldı.'); }; $('#repeatBtn').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ tekrar ayarını değiştirebilir.'); state.repeat = ({ off: 'all', all: 'one', one: 'off' })[state.repeat]; updateRepeatButton(); syncPlayback(!!(state.queue[state.selectedTrack] && (state.queue[state.selectedTrack].source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused))); }; $('#clearQueue').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.socket.emit('room:queue:replace', [], result => { if (result?.error) toast(result.error); else toast('Kuyruk temizlendi.'); }); }; $('#micToggle').onclick = toggleMic; $('#cameraToggle').onclick = toggleCamera;
+$('#playBtn').onclick = togglePlayback; $('#nextBtn').onclick = () => nextTrack(true); $('#prevBtn').onclick = prevTrack; $('#shuffleBtn').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.shuffle = !state.shuffle; $('#shuffleBtn').classList.toggle('active', state.shuffle); syncPlayback(!!state.lastPlayback?.playing); toast(state.shuffle ? 'Karıştırma açıldı.' : 'Karıştırma kapatıldı.'); }; $('#repeatBtn').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.repeat = ({ off: 'all', all: 'one', one: 'off' })[state.repeat]; updateRepeatButton(); syncPlayback(!!state.lastPlayback?.playing); }; $('#clearQueue').onclick = () => { if (!state.isDj) return toast('Yalnızca DJ kuyruğu yönetebilir.'); state.socket.emit('room:queue:replace', [], result => { if (result?.error) toast(result.error); else toast('Kuyruk temizlendi.'); }); }; $('#micToggle').onclick = toggleMic; $('#cameraToggle').onclick = toggleCamera;
 $('#enableRemoteAudio').onclick = async () => { let failed = false; for (const audio of document.querySelectorAll('[data-remote-audio]')) { try { await audio.play(); } catch { failed = true; } } $('#enableRemoteAudio').classList.toggle('hidden', !failed); if (!failed) toast('Karşı tarafın sesi açıldı.'); };
-$('#localAudio').ontimeupdate = () => { if (state.localTrack || state.queue[state.selectedTrack]?.source === 'library') { const a = $('#localAudio'); $('#currentTime').textContent = fmt(a.currentTime); $('#duration').textContent = fmt(a.duration); $('#seekBar').value = a.duration ? a.currentTime / a.duration * 100 : 0; } };
-$('#localAudio').onended = () => nextTrack();
+$('#localAudio').ontimeupdate = () => { if (state.queue[state.selectedTrack]?.source === 'library') { const a = $('#localAudio'); $('#currentTime').textContent = fmt(a.currentTime); $('#duration').textContent = fmt(a.duration); $('#seekBar').value = a.duration ? a.currentTime / a.duration * 100 : 0; } };
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !state.room || !state.socket?.connected) return;
-  const track = state.queue[state.selectedTrack];
-  if (state.isDj && track && (track.source !== 'youtube' || state.ytPlayerReady)) {
-    const playing = track.source === 'youtube' ? state.youtube?.getPlayerState?.() === window.YT?.PlayerState?.PLAYING : !$('#localAudio').paused;
-    syncPlayback(playing);
-    return;
-  }
   state.socket.emit('room:playback:sync', result => { if (result?.playback) applyPlayback(result.playback, true); });
 });
 function fmt(value) { if (!Number.isFinite(value)) return '0:00'; return `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`; }
 setInterval(() => {
-  const track = state.queue[state.selectedTrack]; if (!track) return;
-  const playing = track.source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused;
-  const position = playerPosition(); const duration = track.source === 'youtube' ? state.youtube?.getDuration?.() || 0 : $('#localAudio').duration || 0;
+  const track = state.lastPlayback?.track || state.queue[state.selectedTrack]; if (!track) return;
+  const position = playerPosition(); const duration = roomPlayer.duration();
   $('#currentTime').textContent = fmt(position); $('#duration').textContent = fmt(duration); $('#seekBar').value = duration ? position / duration * 100 : 0;
-  const firstDj = state.participants.find(person => person.isDj);
-  const electedLeader = state.participants.find(person => person.id === state.syncLeaderId) || (state.participants.find(person => person.userId === state.room?.hostId) || firstDj);
-  const syncLeader = electedLeader?.id === state.socket?.id;
-  if (syncLeader && state.room && state.socket?.connected && Date.now() - (state.lastSync || 0) >= 3000) { state.lastSync = Date.now(); state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position, index: state.selectedTrack, track, repeat: state.repeat, shuffle: state.shuffle, heartbeat: true }); }
-  correctPlaybackDrift();
 }, 800);
-$('#seekBar').onchange = e => { const track = state.queue[state.selectedTrack]; if (!state.isDj || !track) return; const value = Number(e.target.value) / 100; const duration = track.source === 'youtube' ? state.youtube?.getDuration?.() || 0 : $('#localAudio').duration || 0; const playing = state.lastPlayback?.playing ?? (track.source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused); syncPlayback(playing, value * duration); };
+setInterval(() => { if (state.room && state.socket?.connected && state.lastPlayback?.playing) state.socket.emit('room:listen:heartbeat'); }, 15000);
+$('#seekBar').onchange = e => { const track = state.queue[state.selectedTrack]; if (!state.isDj || !track) return; const value = Number(e.target.value) / 100; roomPlayer.seek(value * roomPlayer.duration()); };
 $('#volumeRange').oninput = e => { applyLocalMusicVolume(); $('#listenVolume').value = e.target.value; };
 $('#volumeRange').value = localStorage.getItem('km_volume') || '75'; $('#listenVolume').value = $('#volumeRange').value; applyLocalMusicVolume(); $('#volumeRange').addEventListener('change', e => localStorage.setItem('km_volume', e.target.value)); $('#listenVolume').oninput = e => { $('#volumeRange').value = e.target.value; $('#volumeRange').dispatchEvent(new Event('input')); localStorage.setItem('km_volume', e.target.value); }; $('#roomListenToggle').onclick = () => { state.localMusicMuted = !state.localMusicMuted; localStorage.setItem('km_music_muted', state.localMusicMuted ? '1' : '0'); applyLocalMusicVolume(); };
 $('#volumeBtn').onclick = () => { if (matchMedia('(max-width: 570px)').matches) { document.body.classList.toggle('volume-open'); $('#volumeBtn').setAttribute('aria-pressed', document.body.classList.contains('volume-open')); } else { const range = $('#volumeRange'); range.value = Number(range.value) > 0 ? '0' : (localStorage.getItem('km_volume') || '75'); range.dispatchEvent(new Event('input')); range.dispatchEvent(new Event('change')); } };

@@ -334,7 +334,7 @@ app.delete('/api/rooms/:roomId', auth, async (req, res) => {
   if (room.hostId !== req.user.sub && !req.user.admin) return res.status(403).json({ error: 'Bu odayı yalnızca sahibi silebilir.' });
   await db.collection('rooms').deleteOne({ roomId });
   for (const socketId of io.sockets.adapter.rooms.get(roomId) || []) { const member = io.sockets.sockets.get(socketId); member?.emit('room:closed', { roomId }); member?.leave(roomId); if (member) { member.data.roomId = null; member.data.participant = null; } }
-  roomState.delete(roomId); roomPlaybackControlAt.delete(roomId); roomListenStatsAt.delete(roomId); scheduleRoomsUpdate(); res.json({ ok: true });
+  roomState.delete(roomId); roomListenStatsAt.delete(roomId); scheduleRoomsUpdate(); res.json({ ok: true });
 });
 app.get('/api/youtube/search', async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 100);
@@ -425,18 +425,9 @@ app.post('/api/admin/tracks', auth, admin, express.raw({ type: ['audio/mpeg', 'a
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const roomState = new Map();
-const roomPlaybackControlAt = new Map();
-const roomPlaybackLeaderIds = new Map();
 const roomWriteQueues = new Map();
 const roomJoinQueues = new Map();
 const roomListenStatsAt = new Map();
-function getRoomSyncLeader(roomId, set, hostId) {
-  const people = [...(set?.values() || [])];
-  const current = people.find(person => person.id === roomPlaybackLeaderIds.get(roomId) && (person.isHost || person.isDj));
-  const leader = current || people.find(person => person.isHost || person.userId === hostId) || people.find(person => person.isDj) || null;
-  roomPlaybackLeaderIds.set(roomId, leader?.id || null);
-  return leader;
-}
 let roomsUpdateTimer;
 function scheduleRoomsUpdate() {
   clearTimeout(roomsUpdateTimer);
@@ -463,7 +454,7 @@ function queueRoomWrite(roomId, work) {
   current.finally(() => { if (roomWriteQueues.get(roomId) === current) roomWriteQueues.delete(roomId); }).catch(() => {});
   return current;
 }
-const roomMutationEvents = new Set(['room:queue:add', 'room:queue:remove', 'room:queue:replace', 'room:request:add', 'room:request:resolve', 'room:announcement', 'room:poll:create', 'room:poll:vote', 'room:poll:close']);
+const roomMutationEvents = new Set(['room:queue:add', 'room:queue:remove', 'room:queue:replace', 'room:request:add', 'room:request:resolve', 'room:announcement', 'room:poll:create', 'room:poll:vote', 'room:poll:close', 'room:listen:heartbeat']);
 function onAsyncSocket(socket, eventName, handler) {
   socket.on(eventName, (...args) => {
     const acknowledge = typeof args.at(-1) === 'function' ? args.at(-1) : null;
@@ -579,10 +570,8 @@ io.on('connection', socket => {
       await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $pull: { recentRooms: { roomId } } });
       await db.collection('users').updateOne({ _id: new ObjectId(socket.user.sub) }, { $push: { recentRooms: { $each: [{ roomId, name: room.name, mood: room.mood, joinedAt: new Date() }], $position: 0, $slice: 25 } } });
       set.set(socket.id, participant); roomState.set(roomId, set); socket.join(roomId); socket.data.roomId = roomId; socket.data.participant = participant;
-      const syncLeader = getRoomSyncLeader(roomId, set, room.hostId);
-      const playback = { ...(room.playback || { playing: false, position: 0, index: null }), roomId, controllerId: syncLeader?.id || null };
-      done({ room: { roomId, name: room.name, mood: room.mood, visibility: room.visibility || 'public', hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback, playbackControllerId: syncLeader?.id || null, participants: [...set.values()], history: room.history || [], requests: room.requests || [], chat: (room.chat || []).map(message => visibleChatMessage(message, socket.user.sub)), activePoll: visiblePoll(room.activePoll, socket.user.sub), announcement: room.announcement || '', statistics: room.statistics || { plays: 0, seconds: 0 } } });
-      io.to(roomId).emit('room:sync:leader', { roomId, controllerId: syncLeader?.id || null });
+      const playback = { ...(room.playback || { playing: false, position: 0, index: null }), roomId };
+      done({ room: { roomId, name: room.name, mood: room.mood, visibility: room.visibility || 'public', hostId: room.hostId, hostName: room.hostName || '', queue: room.queue || [], playback, participants: [...set.values()], history: room.history || [], requests: room.requests || [], chat: (room.chat || []).map(message => visibleChatMessage(message, socket.user.sub)), activePoll: visiblePoll(room.activePoll, socket.user.sub), announcement: room.announcement || '', statistics: room.statistics || { plays: 0, seconds: 0 } } });
       if (room.playback?.playing) socket.emit('room:playback', { ...room.playback, roomId });
       io.to(roomId).emit('room:participants', { roomId, participants: [...set.values()] });
       scheduleRoomsUpdate();
@@ -647,34 +636,50 @@ io.on('connection', socket => {
   onAsyncSocket(socket, 'room:playback:sync', async (done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }, { projection: { playback: 1 } }) : null;
     if (!room) return done({ error: 'Oda bağlantısı bulunamadı.' });
-    const syncLeader = getRoomSyncLeader(roomId, roomState.get(roomId), room.hostId);
-    done({ playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId, controllerId: syncLeader?.id || null } });
+    done({ playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId } });
+  });
+  onAsyncSocket(socket, 'room:listen:heartbeat', async (done = () => {}) => {
+    const roomId = socket.data.roomId;
+    const room = roomId ? await db.collection('rooms').findOne({ roomId }, { projection: { playback: 1, statistics: 1 } }) : null;
+    if (!room?.playback?.playing) return done({ ok: true, ignored: true });
+    const now = Date.now();
+    const previous = roomListenStatsAt.get(roomId);
+    if (!previous) { roomListenStatsAt.set(roomId, now); return done({ ok: true, ignored: true }); }
+    const seconds = Math.min(30, Math.floor((now - previous) / 1000));
+    if (seconds < 15) return done({ ok: true, ignored: true });
+    roomListenStatsAt.set(roomId, now);
+    const activeUsers = [...new Set([...(roomState.get(roomId)?.values() || [])].map(person => person.userId))];
+    await db.collection('rooms').updateOne({ roomId }, { $inc: { 'statistics.seconds': seconds } });
+    if (activeUsers.length) {
+      const writes = db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.seconds': seconds } } } })));
+      writes.catch(error => console.error('Listening time update failed:', error.message));
+      const activeIds = new Set(activeUsers);
+      for (const recipient of io.of('/').sockets.values()) if (activeIds.has(recipient.user?.sub)) recipient.emit('user:stats', { roomId, seconds });
+    }
+    const roomSeconds = (room.statistics?.seconds || 0) + seconds;
+    io.to(roomId).emit('room:stats', { roomId, statistics: { plays: room.statistics?.plays || 0, seconds: roomSeconds } });
+    done({ ok: true });
   });
   socket.on('room:playback', (state, done = () => {}) => {
     const roomId = socket.data.roomId; if (!roomId || state?.roomId !== roomId) return done({ error: 'Oda bağlantısı bulunamadı. Odaya yeniden katıl.' });
+    if (state.heartbeat) return done({ ok: true, ignored: true });
     queuePlaybackWrite(roomId, async () => {
       if (socket.data.roomId !== roomId) return { error: 'Oda bağlantısı değişti. Odaya yeniden katıl.' };
       const set = roomState.get(roomId); const room = await db.collection('rooms').findOne({ roomId });
       if (!room || (!set?.get(socket.id)?.isDj && room.hostId !== socket.user.sub && !socket.user.admin)) return { error: 'Oynatma kontrolü yalnızca oda sahibi veya DJ kullanabilir.' };
-      if (state.heartbeat) {
-        const leader = getRoomSyncLeader(roomId, set, room.hostId);
-        if (leader?.id !== socket.id || Date.now() - (roomPlaybackControlAt.get(roomId) || 0) < 2500) return { ok: true, ignored: true };
-      }
-      else { roomPlaybackLeaderIds.set(roomId, socket.id); roomPlaybackControlAt.set(roomId, Date.now()); }
       const queue = room.queue || []; let index = null; let track = null;
       if (state.track?.id) { index = queue.findIndex(item => item.id === state.track.id); if (index < 0) return { error: 'Bu parça artık oda kuyruğunda değil. Kuyruğu yenile.' }; track = queue[index]; }
       else if (Number.isInteger(state.index) && state.index >= 0 && state.index < queue.length) { index = state.index; track = queue[index]; }
       if (state.playing && !track) return { error: 'Oynatılacak parça bulunamadı.' };
-      const playback = { roomId, revision: (room.playback?.revision || 0) + 1, controllerId: roomPlaybackLeaderIds.get(roomId) || socket.id, playing: !!state.playing && !!track, position: track ? Math.max(0, Number(state.position) || 0) : 0, index, track, repeat: ['off', 'all', 'one'].includes(state.repeat) ? state.repeat : (room.playback?.repeat || 'off'), shuffle: !!state.shuffle, updatedAt: new Date(), serverTime: Date.now() };
+      const playback = { roomId, revision: (room.playback?.revision || 0) + 1, playing: !!state.playing && !!track, position: track ? Math.max(0, Number(state.position) || 0) : 0, index, track, repeat: ['off', 'all', 'one'].includes(state.repeat) ? state.repeat : (room.playback?.repeat || 'off'), shuffle: !!state.shuffle, updatedAt: new Date(), serverTime: Date.now() };
       const trackChanged = !!track && track.id !== room.playback?.track?.id;
       const roomUpdate = { $set: { playback } };
       if (trackChanged) {
         const historyEntry = { trackId: track.id, title: track.title, artist: track.artist || '', source: track.source, videoId: track.videoId || '', url: track.url || '', playedBy: socket.user.username, playedAt: new Date() };
         roomUpdate.$push = { history: { $each: [historyEntry], $position: 0, $slice: 30 } }; roomUpdate.$inc = { 'statistics.plays': 1 };
       }
-      if (state.heartbeat && !roomListenStatsAt.has(roomId)) roomListenStatsAt.set(roomId, Date.now());
-      const secondsSinceStats = state.heartbeat ? Math.min(15, Math.max(0, Math.floor((Date.now() - (roomListenStatsAt.get(roomId) || Date.now())) / 1000))) : 0;
-      if (state.heartbeat && secondsSinceStats >= 15) { roomListenStatsAt.set(roomId, Date.now()); if (playback.playing) roomUpdate.$inc = { ...(roomUpdate.$inc || {}), 'statistics.seconds': 15 }; }
+      if (playback.playing && (trackChanged || !room.playback?.playing)) roomListenStatsAt.set(roomId, Date.now());
+      else if (!playback.playing) roomListenStatsAt.delete(roomId);
       await db.collection('rooms').updateOne({ roomId }, roomUpdate);
       io.to(roomId).emit('room:playback', playback);
       const activeUsers = [...new Set([...(roomState.get(roomId)?.values() || [])].map(person => person.userId))];
@@ -687,12 +692,7 @@ io.on('connection', socket => {
         const activeUserIds = new Set(activeUsers);
         for (const recipient of io.of('/').sockets.values()) if (activeUserIds.has(recipient.user?.sub)) recipient.emit('user:history', { entry: recent });
       }
-      if (secondsSinceStats >= 15 && playback.playing) {
-        if (activeUsers.length) backgroundWrites.push(db.collection('users').bulkWrite(activeUsers.map(userId => ({ updateOne: { filter: { _id: new ObjectId(userId) }, update: { $inc: { 'musicStats.seconds': 15 } } } }))));
-        const activeUserIds = new Set(activeUsers);
-        for (const recipient of io.of('/').sockets.values()) if (activeUserIds.has(recipient.user?.sub)) recipient.emit('user:stats', { roomId, seconds: 15 });
-      }
-      if (trackChanged || (secondsSinceStats >= 15 && playback.playing)) io.to(roomId).emit('room:stats', { roomId, statistics: { plays: (room.statistics?.plays || 0) + (trackChanged ? 1 : 0), seconds: (room.statistics?.seconds || 0) + (secondsSinceStats >= 15 && playback.playing ? 15 : 0) } });
+      if (trackChanged) io.to(roomId).emit('room:stats', { roomId, statistics: { plays: (room.statistics?.plays || 0) + 1, seconds: room.statistics?.seconds || 0 } });
       if (backgroundWrites.length) Promise.all(backgroundWrites).catch(error => console.error('Listening statistics update failed:', error.message));
       if (trackChanged) scheduleRoomsUpdate(); return { ok: true, revision: playback.revision, playback };
     }).then(result => done(result || { ok: true })).catch(error => { console.error('Playback sync failed:', error.message); done({ error: 'Oynatma güncellenemedi. Tekrar dene.' }); });
@@ -806,12 +806,7 @@ io.on('connection', socket => {
 async function leaveCurrentRoom(socket) {
   const roomId = socket.data.roomId; if (!roomId) return;
   const set = roomState.get(roomId); set?.delete(socket.id); socket.leave(roomId); socket.data.roomId = null;
-  if (!set?.size) { roomState.delete(roomId); roomPlaybackControlAt.delete(roomId); roomPlaybackLeaderIds.delete(roomId); roomListenStatsAt.delete(roomId); }
-  else if (roomPlaybackLeaderIds.get(roomId) === socket.id) {
-    const leader = [...set.values()].find(person => person.isHost) || [...set.values()].find(person => person.isDj) || null;
-    roomPlaybackLeaderIds.set(roomId, leader?.id || null);
-    io.to(roomId).emit('room:sync:leader', { roomId, controllerId: leader?.id || null });
-  }
+  if (!set?.size) { roomState.delete(roomId); roomListenStatsAt.delete(roomId); }
   io.to(roomId).emit('room:participants', { roomId, participants: [...(set?.values() || [])] });
   scheduleRoomsUpdate();
 }
