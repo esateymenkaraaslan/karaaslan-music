@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Karaaslan Müzik">
+  <defs>
+    <linearGradient id="a" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#7555e9"/><stop offset="1" stop-color="#ff806e"/></linearGradient>
+    <linearGradient id="b" x1="0" y1="1" x2="1" y2="0"><stop stop-color="#6ec8a6"/><stop offset="1" stop-color="#a68cff"/></linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="34" fill="#f0eaff"/>
+  <path d="M31 77c9-22 18-32 29-32 12 0 17 12 26 12 5 0 9-4 13-12" fill="none" stroke="url(#a)" stroke-linecap="round" stroke-width="9"/>
+  <path d="M31 91c9-16 17-23 27-23 10 0 15 9 24 9 6 0 11-4 17-10" fill="none" stroke="url(#b)" stroke-linecap="round" stroke-width="7"/>
+  <circle cx="32" cy="45" r="6" fill="#ff806e"/><circle cx="97" cy="44" r="6" fill="#7555e9"/>
+</svg>

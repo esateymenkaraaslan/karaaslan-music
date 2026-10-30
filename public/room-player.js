@@ -21,6 +21,7 @@ class RoomPlayer {
     this.pending = null;
     this.loadedTrackId = null;
     this.gestureRequired = false;
+    this.localPaused = false;
     this.apiPromise = null;
     this.clockOffsetMs = 0;
     this.clockSynced = false;
@@ -69,15 +70,25 @@ class RoomPlayer {
   receive(playback, force = false) {
     if (!playback || playback.roomId !== this.roomId) return;
     const revision = Number(playback.revision) || 0;
-    if (!force && revision <= this.revision) return;
+    if (this.snapshot && revision < this.revision) return;
+    if (this.snapshot && revision === this.revision && !force) return;
     this.revision = Math.max(this.revision, revision);
     this.snapshot = playback;
+    this.localPaused = false;
     this.onSnapshot?.(playback);
     if (!playback.track) return this.clear();
     const generation = ++this.generation;
     this.pending = { playback, generation };
     if (playback.track.source === 'youtube') this.prepareYoutube(playback, generation);
     else this.prepareLocal(playback, generation);
+  }
+
+  resync(playback) {
+    if (!playback || playback.roomId !== this.roomId) return;
+    const revision = Number(playback.revision) || 0;
+    if (this.snapshot && revision < this.revision) return;
+    if (this.localPaused && revision === this.revision) return;
+    this.receive(playback, revision === this.revision);
   }
 
   command({ playing, position, index = this.getIndex() }) {
@@ -115,7 +126,15 @@ class RoomPlayer {
   }
 
   toggle() {
-    if (this.gestureRequired || (!this.canControl() && this.snapshot?.playing)) return this.resumeLocal();
+    if (this.gestureRequired) return this.resumeLocal();
+    if (!this.canControl() && this.snapshot?.playing) {
+      if (this.localPaused) return this.resumeLocal();
+      if (this.snapshot.track?.source === 'youtube') this.player?.pauseVideo?.();
+      else this.audio?.pause();
+      this.localPaused = true;
+      this.syncPlayButton(false);
+      return;
+    }
     if (!this.canControl()) return this.onError?.('Oynatmayı oda DJ’i yönetiyor.');
     const playing = !this.snapshot?.playing;
     this.command({ playing, position: this.position() });
@@ -154,7 +173,7 @@ class RoomPlayer {
       const estimate = Number(result.serverNow) - (sentAt + receivedAt) / 2;
       this.clockOffsetMs = this.clockSynced ? this.clockOffsetMs * 0.8 + estimate * 0.2 : estimate;
       this.clockSynced = true;
-      if (this.snapshot?.playing) this.receive(this.snapshot, true);
+      if (this.snapshot?.playing) this.correctDrift();
     });
   }
 
@@ -262,7 +281,7 @@ class RoomPlayer {
 
   correctDrift() {
     const playback = this.snapshot;
-    if (!playback?.playing || !playback.track || !this.roomId) return;
+    if (!playback?.playing || !playback.track || !this.roomId || this.localPaused) return;
     const target = this.target(playback);
     if (playback.track.source === 'youtube') {
       if (!this.playerReady || this.player?.getPlayerState?.() !== window.YT?.PlayerState?.PLAYING) return;
@@ -276,6 +295,7 @@ class RoomPlayer {
   resumeLocal() {
     const playback = this.snapshot;
     if (!playback?.track) return;
+    this.localPaused = false;
     const target = this.target(playback);
     if (playback.track.source === 'youtube') {
       if (!this.playerReady || !this.player) return this.onError?.('Oynatıcı hazırlanıyor; birkaç saniye sonra tekrar dokun.');
