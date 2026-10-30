@@ -243,7 +243,7 @@ async function ytSearchId(videoId) {
   if (!window.YT?.Player) throw new Error('YouTube oynatıcı hazır değil. Biraz sonra yeniden dene.');
   return videoId;
 }
-async function playAt(index) {
+function playAt(index) {
   if (!state.isDj) return toast('Yalnızca oda sahibi veya DJ müziği yönetebilir.');
   if (index < 0 || index >= state.queue.length) return;
   syncPlayback(true, 0, index);
@@ -314,7 +314,7 @@ function applyPendingYoutube() {
   state.pendingYoutube = null;
 }
 function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
-function syncPlayback(playing = true, position = playerPosition(), index = state.selectedTrack) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position, index, track: state.queue[index], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); }
+function syncPlayback(playing = true, position = playerPosition(), index = state.selectedTrack) { if (!state.socket || !state.room || !state.isDj) return; const roomId = state.room.roomId; state.socket.emit('room:playback', { roomId, playing, position, index, track: state.queue[index], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); else if (result?.playback && state.room?.roomId === roomId) applyPlayback(result.playback, true); }); }
 function togglePlayback() {
   if (state.playbackNeedsGesture || (!state.isDj && state.lastPlayback?.playing)) return resumeLocalPlayback();
   if (!state.isDj) {

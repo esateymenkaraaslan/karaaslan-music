@@ -694,7 +694,7 @@ io.on('connection', socket => {
       }
       if (trackChanged || (secondsSinceStats >= 15 && playback.playing)) io.to(roomId).emit('room:stats', { roomId, statistics: { plays: (room.statistics?.plays || 0) + (trackChanged ? 1 : 0), seconds: (room.statistics?.seconds || 0) + (secondsSinceStats >= 15 && playback.playing ? 15 : 0) } });
       if (backgroundWrites.length) Promise.all(backgroundWrites).catch(error => console.error('Listening statistics update failed:', error.message));
-      if (trackChanged) scheduleRoomsUpdate(); return { ok: true, revision: playback.revision };
+      if (trackChanged) scheduleRoomsUpdate(); return { ok: true, revision: playback.revision, playback };
     }).then(result => done(result || { ok: true })).catch(error => { console.error('Playback sync failed:', error.message); done({ error: 'Oynatma güncellenemedi. Tekrar dene.' }); });
   });
   onAsyncSocket(socket, 'room:dj:assign', async (userId, done = () => {}) => {
