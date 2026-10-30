@@ -636,7 +636,7 @@ io.on('connection', socket => {
   onAsyncSocket(socket, 'room:playback:sync', async (done = () => {}) => {
     const roomId = socket.data.roomId; const room = roomId ? await db.collection('rooms').findOne({ roomId }, { projection: { playback: 1 } }) : null;
     if (!room) return done({ error: 'Oda bağlantısı bulunamadı.' });
-    done({ playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId } });
+    done({ playback: { ...(room.playback || { playing: false, position: 0, index: null }), roomId }, serverNow: Date.now() });
   });
   onAsyncSocket(socket, 'room:listen:heartbeat', async (done = () => {}) => {
     const roomId = socket.data.roomId;

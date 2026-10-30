@@ -22,6 +22,9 @@ class RoomPlayer {
     this.loadedTrackId = null;
     this.gestureRequired = false;
     this.apiPromise = null;
+    this.clockOffsetMs = 0;
+    this.clockSynced = false;
+    this.clockSyncPending = false;
     this.onSocketPlayback = playback => this.receive(playback);
     this.onAudioEnded = () => this.onEnded?.();
     this.onPlayerReady = () => { this.playerReady = true; this.applyPending(); };
@@ -35,6 +38,7 @@ class RoomPlayer {
     this.playButton = document.querySelector('#playBtn');
     if (this.audio) this.audio.addEventListener('ended', this.onAudioEnded);
     this.corrector = setInterval(() => this.correctDrift(), 900);
+    this.clockSyncTimer = setInterval(() => this.syncClock(), 30000);
   }
 
   bind(socket) {
@@ -50,6 +54,7 @@ class RoomPlayer {
     this.revision = 0;
     this.loadedTrackId = null;
     this.pending = null;
+    this.syncClock();
     if (room?.playback?.track) this.receive({ ...room.playback, roomId: this.roomId }, true);
     else this.clear();
   }
@@ -132,7 +137,25 @@ class RoomPlayer {
   target(playback = this.snapshot) {
     const position = Math.max(0, Number(playback?.position) || 0);
     const serverTime = Number(playback?.serverTime) || Date.now();
-    return position + (playback?.playing ? Math.max(0, (Date.now() - serverTime) / 1000) : 0);
+    return position + (playback?.playing ? Math.max(0, (Date.now() + this.clockOffsetMs - serverTime) / 1000) : 0);
+  }
+
+  syncClock() {
+    if (this.clockSyncPending || !this.roomId || !this.socket?.connected) return;
+    const roomId = this.roomId;
+    const sentAt = Date.now();
+    this.clockSyncPending = true;
+    const timeout = setTimeout(() => { this.clockSyncPending = false; }, 5000);
+    this.socket.emit('room:playback:sync', result => {
+      clearTimeout(timeout);
+      this.clockSyncPending = false;
+      if (roomId !== this.roomId || !Number.isFinite(Number(result?.serverNow))) return;
+      const receivedAt = Date.now();
+      const estimate = Number(result.serverNow) - (sentAt + receivedAt) / 2;
+      this.clockOffsetMs = this.clockSynced ? this.clockOffsetMs * 0.8 + estimate * 0.2 : estimate;
+      this.clockSynced = true;
+      if (this.snapshot?.playing) this.receive(this.snapshot, true);
+    });
   }
 
   async prepareYoutube(playback, generation) {
