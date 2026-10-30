@@ -246,14 +246,7 @@ async function ytSearchId(videoId) {
 async function playAt(index) {
   if (!state.isDj) return toast('Yalnızca oda sahibi veya DJ müziği yönetebilir.');
   if (index < 0 || index >= state.queue.length) return;
-  const epoch = state.roomEpoch;
-  const item = state.queue[index]; state.selectedTrack = index; state.localTrack = null; $('#playerPlaceholder').classList.add('hidden'); $('#localStage').classList.add('hidden'); $('#ytPlayer').classList.remove('hidden'); $('#nowTitle').textContent = item.title; $('#nowArtist').textContent = item.artist || '';
-  state.queueLocked = true; syncPlayback(true, 0); renderQueue();
-  if (await loadTrackMedia(item, 0, true, Date.now()) === false) {
-    if (epoch === state.roomEpoch && state.queue[state.selectedTrack]?.id === item.id) syncPlayback(false, 0);
-    return;
-  }
-  if (epoch !== state.roomEpoch) return;
+  syncPlayback(true, 0, index);
 }
 function requirePlaybackGesture() {
   state.playbackNeedsGesture = true;
@@ -321,7 +314,7 @@ function applyPendingYoutube() {
   state.pendingYoutube = null;
 }
 function playerPosition() { if (state.selectedTrack == null) return 0; const track = state.queue[state.selectedTrack]; return track?.source === 'youtube' ? (state.youtube?.getCurrentTime?.() || 0) : ($('#localAudio').currentTime || 0); }
-function syncPlayback(playing = true, position = playerPosition()) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position, index: state.selectedTrack, track: state.queue[state.selectedTrack], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); $('#playBtn').textContent = playing ? 'Ⅱ' : '▶'; }
+function syncPlayback(playing = true, position = playerPosition(), index = state.selectedTrack) { if (!state.socket || !state.room || !state.isDj) return; state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position, index, track: state.queue[index], repeat: state.repeat, shuffle: state.shuffle }, result => { if (result?.error) toast(result.error); }); }
 function togglePlayback() {
   if (state.playbackNeedsGesture || (!state.isDj && state.lastPlayback?.playing)) return resumeLocalPlayback();
   if (!state.isDj) {
@@ -331,9 +324,6 @@ function togglePlayback() {
   const track = state.queue[state.selectedTrack]; if (!track) { clearPlaybackSurface(); return toast('Bu odanın kuyruğu boş.'); }
   const currentlyPlaying = track.source === 'youtube' && (state.pendingYoutube?.trackId === track.id ? state.pendingYoutube.playing : !!state.youtube && !!window.YT && state.youtube.getPlayerState?.() === window.YT.PlayerState.PLAYING);
   const playing = track.source === 'youtube' ? !currentlyPlaying : $('#localAudio').paused;
-  if (track.source === 'youtube' && state.pendingYoutube?.trackId === track.id && !state.ytPlayerReady) state.pendingYoutube.playing = playing;
-  if (track.source === 'youtube') { if (playing) state.youtube?.playVideo?.(); else state.youtube?.pauseVideo?.(); }
-  else if (playing) $('#localAudio').play().catch(() => {}); else $('#localAudio').pause();
   syncPlayback(playing);
 }
 function resumeLocalPlayback() {
@@ -387,7 +377,7 @@ function correctPlaybackDrift() {
 }
 function updateRepeatButton() { const button = $('#repeatBtn'); if (!button) return; button.dataset.mode = state.repeat; button.title = `Tekrar: ${{ off: 'Kapalı', all: 'Tüm sıra', one: 'Tek şarkı' }[state.repeat]}`; button.classList.toggle('active', state.repeat !== 'off'); }
 function nextTrack(manual = false) { if (!state.queue.length || !state.isDj) return; if (!manual && state.repeat === 'one') return playAt(state.selectedTrack ?? 0); if (!manual && state.repeat === 'off' && state.selectedTrack === state.queue.length - 1) { syncPlayback(false); return; } let next = ((state.selectedTrack ?? -1) + 1) % state.queue.length; if (state.shuffle && state.queue.length > 1) { const choices = state.queue.map((_, i) => i).filter(i => i !== state.selectedTrack); next = choices[Math.floor(Math.random() * choices.length)]; } playAt(next); }
-function prevTrack() { if (!state.isDj) return; if (playerPosition() > 3) { if (state.queue[state.selectedTrack]?.source === 'youtube') state.youtube?.seekTo(0, true); else $('#localAudio').currentTime = 0; syncPlayback(true); return; } if (state.queue.length) playAt((state.selectedTrack - 1 + state.queue.length) % state.queue.length); }
+function prevTrack() { if (!state.isDj) return; if (playerPosition() > 3) { syncPlayback(true, 0); return; } if (state.queue.length) playAt((state.selectedTrack - 1 + state.queue.length) % state.queue.length); }
 function appendChat(msg) { if (!msg?.id || state.chatMessages.some(item => item.id === msg.id)) return; state.chatMessages.push(msg); state.chatMessages = state.chatMessages.slice(-100); renderChat(); $('#chatBadge').textContent = Number($('#chatBadge').textContent || 0) + 1; }
 function applyLocalMusicVolume() { const volume = state.localMusicMuted ? 0 : Number($('#volumeRange')?.value || 75) / 100; const audio = $('#localAudio'); if (audio) audio.volume = volume; state.youtube?.setVolume?.(volume * 100); const button = $('#roomListenToggle'); if (button) { button.textContent = state.localMusicMuted ? '🎧 Müzik sessiz' : '🎧 Müziği dinle'; button.setAttribute('aria-pressed', String(state.localMusicMuted)); button.title = state.localMusicMuted ? 'Oda müziğinin sesini bu cihazda aç' : 'Oda müziğini bu cihazda sessize al'; } }
 function renderChat() {
@@ -714,7 +704,7 @@ setInterval(() => {
   if (syncLeader && state.room && state.socket?.connected && Date.now() - (state.lastSync || 0) >= 3000) { state.lastSync = Date.now(); state.socket.emit('room:playback', { roomId: state.room.roomId, playing, position, index: state.selectedTrack, track, repeat: state.repeat, shuffle: state.shuffle, heartbeat: true }); }
   correctPlaybackDrift();
 }, 800);
-$('#seekBar').onchange = e => { const track = state.queue[state.selectedTrack]; if (!state.isDj || !track) return; const value = Number(e.target.value) / 100; if (track.source === 'youtube') state.youtube?.seekTo(value * (state.youtube.getDuration() || 0), true); else $('#localAudio').currentTime = value * ($('#localAudio').duration || 0); const playing = track.source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused; syncPlayback(playing); };
+$('#seekBar').onchange = e => { const track = state.queue[state.selectedTrack]; if (!state.isDj || !track) return; const value = Number(e.target.value) / 100; const duration = track.source === 'youtube' ? state.youtube?.getDuration?.() || 0 : $('#localAudio').duration || 0; const playing = state.lastPlayback?.playing ?? (track.source === 'youtube' ? state.youtube?.getPlayerState?.() === 1 : !$('#localAudio').paused); syncPlayback(playing, value * duration); };
 $('#volumeRange').oninput = e => { applyLocalMusicVolume(); $('#listenVolume').value = e.target.value; };
 $('#volumeRange').value = localStorage.getItem('km_volume') || '75'; $('#listenVolume').value = $('#volumeRange').value; applyLocalMusicVolume(); $('#volumeRange').addEventListener('change', e => localStorage.setItem('km_volume', e.target.value)); $('#listenVolume').oninput = e => { $('#volumeRange').value = e.target.value; $('#volumeRange').dispatchEvent(new Event('input')); localStorage.setItem('km_volume', e.target.value); }; $('#roomListenToggle').onclick = () => { state.localMusicMuted = !state.localMusicMuted; localStorage.setItem('km_music_muted', state.localMusicMuted ? '1' : '0'); applyLocalMusicVolume(); };
 $('#volumeBtn').onclick = () => { if (matchMedia('(max-width: 570px)').matches) { document.body.classList.toggle('volume-open'); $('#volumeBtn').setAttribute('aria-pressed', document.body.classList.contains('volume-open')); } else { const range = $('#volumeRange'); range.value = Number(range.value) > 0 ? '0' : (localStorage.getItem('km_volume') || '75'); range.dispatchEvent(new Event('input')); range.dispatchEvent(new Event('change')); } };
